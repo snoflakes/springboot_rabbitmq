@@ -1,2139 +1,1939 @@
-## 	★<font color='#900000'>P321-服务配置</font>
+## 1. 基本概念
 
-### 1.1 页面索引
+### 1.1 什么是 MQ
+
+​		  MQ(message queue)，从字面意思上看，本质是个队列，FIFO 先入先出，只不过队列中存放的内容是 message 而已，还是一种跨进程的通信机制，用于上下游传递消息。
+
+### 1.2 为什么要用 MQ 
+
+1.**<font color='#900000'>流量消峰</font>**
+
+​		 举个例子，如果订单系统最多能处理一万次订单，这个处理能力应付正常时段的下单时绰绰有余，正常时段我们下单一秒后就能返回结果。但是在高峰期，如果有两万次下单操作系统是处理不了的，只能限 制订单超过一万后不允许用户下单。使用消息队列做缓冲，我们可以取消这个限制，把一秒内下的订单分 散成一段时间来处理，这时有些用户可能在下单十几秒后才能收到下单成功的操作，但是比不能下单的体 验要好。
+
+2.**<font color='#900000'>应用解耦</font>**
+
+​		 以电商应用为例，应用中有订单系统、库存系统、物流系统、支付系统。用户创建订单后，如果耦合 调用库存系统、物流系统、支付系统，任何一个子系统出了故障，都会造成下单操作异常。当转变成基于 消息队列的方式后，系统间调用的问题会减少很多，比如物流系统因为发生故障，需要几分钟来修复。在 这几分钟的时间里，物流系统要处理的内存被缓存在消息队列中，用户的下单操作可以正常完成。当物流 系统恢复后，继续处理订单信息即可，中单用户感受不到物流系统的故障，提升系统的可用性。
+
+3.**<font color='#900000'>异步处理</font>**
+
+例如 A 调用 B，B 需要花费很长时间执行，当 B 处理完成后，会发送一条消息给 MQ，MQ 会将此 消息转发给 A 服务。这样 A 服务既不用循环调用 B 的查询 api，也不用提供 callback api。同样 B 服务也不用做这些操作。
+
+​		 有些服务间调用是异步的，例如 A 调用 B，B 需要花费很长时间执行，但是 A 需要知道 B 什么时候可以执行完，以前一般有两种方式，A 过一段时间去调用 B 的查询 api 查询。或者 A 提供一个 callback api， B 执行完之后调用 api 通知 A 服务。这两种方式都不是很优雅，使用消息总线，可以很方便解决这个问题， A 调用 B 服务后，只需要监听 B 处理完成的消息，当 B 处理完成后，会发送一条消息给 MQ，MQ 会将此 消息转发给 A 服务。这样 A 服务既不用循环调用 B 的查询 api，也不用提供 callback api。同样 B 服务也不用做这些操作。A 服务还能及时的得到异步处理成功的消息。
+
+### 1.2 Kafka、RocketMQ、RabbitMQ的优劣势比较
+
+#### 1.2.1 Kafka
+
+优势: 日志采集功能，肯定是首选kafka了
+
+- 单机写入TPS约在**百万条/秒**，最大的优点，就是**吞吐量高**
+- 在**大数据**领域的**实时计算**以及**日志采集**被大规模使用
+
+缺点:
+
+- Kafka单机**<font color='#900000'>超过64个队列/分区，Load会发生明显的飙高现象</font>**，队列越多，load越高，发送消息响应时间变长
+- <font color='#900000'>**消费失败不支持重试**</font>
+- 使用短轮询方式，实时性取决于轮询间隔时间
+
+#### 1.2.2 RocketMQ
+
+优势: **为金融互联网领域**
+
+- 支持10亿级别的消息堆积，不会因为堆积导致性能下降
+- 经过参数优化配置，消息可以做到0丢失
+
+缺点:
+
+- **支持的客户端语言不多**，目前是java及c++，其中c++不成熟
+- 没有在 mq 核心中去实现JMS等接口，**有些系统要迁移需要修改大量代码**
+
+#### 1.2.3 RabbitMQ
+
+- 由于erlang语言的特性，mq **性能较好，高并发**
+- 吞吐量到万级，MQ功能比较完备
+- 健壮、稳定、易用、跨平台、支持多种语言、文档齐全
+
+缺点:
+
+- erlang开发，很难去看懂源码，基本只能依赖于开源社区的快速维护和修复bug，不利于做二次开发和维护
+- RabbitMQ确实吞吐量会低一些，这是因为他做的实现机制比较重
+- 需要学习比较复杂的接口和协议，学习和维护成本较高。
+
+#### <font color='#900000'>针对RabbitMQ确实吞吐量低的解决方案</font>：
+
+① 既然消费能力不足，那就**扩展更多消费节点**，提升消费能力；
+② 建立专门的队列消费服务，将消息批量**取出并持久化**，之后再慢慢消费。
+
+① 就是最直接的方式，也是消息积压最常用的解决方案，但有些企业考虑到服务器**成本**压力，会选择第 
+
+② 种方案进行迂回，先通过一个独立服务把要消费的消息存起来，比如存到数据库，之后再慢慢处理这些消息即可。
+
+#### <font color='#900000'>消息重复解决方案</font>：
+
+1. 原因：
+
+   ①消息消费成功，事务已提交，签收时结果**服务器宕机或网络原因**导致签收失败，消息状态会由unack转变为ready，重新发送给其他消费方；
+   ②**消息消费失败**，由于retry重试机制，重新入队又将消息发送出去。
+
+2. 解决方案：
+
+   ①消费方业务接口做好幂等；
+   ②消息日志表保存MQ发送时的唯一消息ID，消费方可以根据这个唯一ID进行判断避免消息重复
+
+   幂等性解决：Redis 原子性利用 redis 执行 **`setnx`** 命令，天然具有幂等性。从而实现不重复消费
+
+### 1.3 MQ 的选择 
+
+1.Kafka
+
+​		主要特点是基于 Pull 的模式来处理消息消费，追求高吞吐量，一开始的目的就是用于日志收集 和传输，适合产生大量数据的互联网服务的数据收集业务。大型公司建议可以选用，**如果有日志采集功能， 肯定是首选 kafka** 了。尚硅谷官网 kafka 视频连接 http://www.gulixueyuan.com/course/330/tasks 
+
+2.RocketMQ 
+
+​		天生**为金融互联网领域**而生，对于**可靠性要求很高**的场景，尤其是电商里面的订单扣款，以及业务削 峰，在大量交易涌入时，后端可能无法及时处理的情况。RoketMQ 在稳定性上可能更值得信赖，这些业务 场景在阿里双 11 已经经历了多次考验，如果你的业务有上述并发场景，建议可以选择 RocketMQ。 
+
+3.RabbitMQ 结合 
+
+​		erlang 语言本身的并发优势，性能好时效性微秒级，社区活跃度也比较高，管理界面用起来十分 方便，如果你的**数据量没有那么大**，中小型公司优先选择功能比较完备的 RabbitMQ。
+
+## 2. RabbitMQ
+
+### 2.1 四大核心
+
+生产者、交换机、队列、消费者
+
+### 2.2 RabbitMQ工作原理
+
+<img src="C:/Users/13656/Desktop/学习笔记/消息中间件/rabbitMq/image-20220623224204394.png" alt="image-20220623224204394" style="zoom:67%;" />
+
+**<font color='#900000'>Broker</font>：**接收和分发消息的应用，RabbitMQ Server 就是 Message Broker 
+
+**<font color='#900000'>Virtual host</font>：**出于多租户和安全因素设计的，把 AMQP 的基本组件划分到一个虚拟的分组中，类似 于网络中的 namespace 概念。当多个不同的用户使用同一个 RabbitMQ server 提供的服务时，可以划分出 多个 vhost，每个用户在自己的 vhost 创建 exchange／queue 等 
+
+**<font color='#900000'>Connection</font>：**publisher／consumer 和 broker 之间的 TCP 连接 
+
+**<font color='#900000'>Channel</font>**：如果每一次访问 RabbitMQ 都建立一个 Connection，在消息量大的时候建立 TCP  **<font color='#900abc'>Connection 的开销将是巨大的，效率也较低</font>**，Channel 是在 connection 内部建立的逻辑连接，如果应用程序支持多线程，通常每个 thread 创建单独的 channel 进行通讯，AMQP method 包含了 channel id 帮助客户端和 message broker 识别 channel，所以 channel 之间是完全隔离的。**Channel 作为轻量级的 Connection 极大减少了操作系统建立 TCP connection 的开销**  
+
+**<font color='#900000'>Exchange</font>**：message 到达 broker 的第一站，根据分发规则，匹配查询表中的 routing key，分发 消息到 queue 中去。常用的类型有：direct (point-to-point), topic (publish-subscribe) and fanout  (multicast) 
+
+**<font color='#900000'>Queue</font>**：消息最终被送到这里等待 consumer 取走 
+
+**<font color='#900000'>Binding</font>**：exchange 和 queue 之间的虚拟连接，binding 中可以包含 routing key，Binding 信息被保 存到 exchange 中的查询表中，用于 message 的分发依据
+
+## 3. RabbitMQ的安装 
+
+1.官网地址 
+
+​		https://www.rabbitmq.com/download.html 
+
+2.文件上传 
+
+​		上传到/usr/local/software 目录下(如果没有 software 需要自己创建)
+
+![image-20230303095422627](C:/Users/13656/Desktop/学习笔记/消息中间件/rabbitMq/image-20230303095422627.png)
+
+3.安装文件(分别按照以下顺序安装)
+
+```shell
+rpm -ivh erlang-21.3-1.el7.x86_64.rpm
+yum install socat -y
+rpm -ivh rabbitmq-server-3.8.8-1.el7.noarch.rpm
+```
+
+ 4.常用命令(按照以下顺序执行) 
+
+```shell
+# 添加开机启动 RabbitMQ 服务
+chkconfig rabbitmq-server on
+# 启动服务
+/sbin/service rabbitmq-server start 
+# 查看服务状态
+/sbin/service rabbitmq-server status
+# 停止服务(选择执行)
+/sbin/service rabbitmq-server stop 
+# 开启 web 管理插件（安装该插件之前需要先停止服务）
+rabbitmq-plugins enable rabbitmq_management
+```
+
+注：用默认账号密码(guest)访问地址 http://192.168.10.104:15672/出现权限问题
+
+![image-20230303100713667](C:/Users/13656/Desktop/学习笔记/消息中间件/rabbitMq/image-20230303100713667.png)
+
+5.添加一个新的用户
+
+```shell
+# 创建账号
+rabbitmqctl add_user admin admin
+# 设置用户角色
+rabbitmqctl set_user_tags admin administrator
+# 设置用户权限
+eg：set_permissions [-p <vhostpath>] <user> <conf> <write> <read>
+rabbitmqctl set_permissions -p "/" admin ".*" ".*" ".*"
+#用户 user_admin 具有/vhost1 这个 virtual host 中所有资源的配置、写、读权限 当前用户和角色
+rabbitmqctl list_users
+```
+
+6.再次利用 admin 用户登录
 
 ```
-src/main/java/com/sitech/pgcenter/service/impl/PdGoodsPrcDictServiceImpl.java
-src/main/java/com/sitech/pgcenter/service/impl/GrpGoodsCfgServiceImpl.java
-src/main/java/com/sitech/pgcenter/comp/inter/IOutBillingInterCo.java
-com/sitech/pgcenter/comp/inter/IGrpGoodsCfgCo.java
+账号：admin
+密码：admin
 ```
 
+![image-20230303100942982](C:/Users/13656/Desktop/学习笔记/消息中间件/rabbitMq/image-20230303100942982.png)
 
+7.重置命令
 
-```mysql
-起始页：pgcmng_op_web_view/pgcmng-base-app/npage/busi/gdfamily/P005/P005.html
-新增页：pgcmng_op_web_view/pgcmng-base-app/npage/busi/gdfamily/P005/P005_insert.html
-js: pgcmng_op_web_view/pgcmng-base-app/nresource/assets/js/busi/gdfamily/P005/P005_insert.js
-创建接口：IPdSvcDictAoSvc_insertPdSvcDict
-修改接口：IPdSvcDictAoSvc_updatePdSvcDict
-新建服务后查询SQL:
-SELECT PROD_ID,PROD_NAME,PROD_TYPE,MASTER_SERV_ID,STATE FROM PD_PROD_DICT WHERE PROD_ID = '服务ID'
+```shell
+# 关闭应用的命令为
+rabbitmqctl stop_app
+# 清除的命令为
+rabbitmqctl reset
+# 重新启动命令为
+rabbitmqctl start_app
 ```
 
-### 1.2.1 主题服务类型
+## 4. 代码样例
 
-> （1）取值来源
->
-> ```mysql
-> 查询接口：IPdMasterDictSvc_queryPdMasterDictList
-> # 查询口径；MASTER_SERV_ID,MASTER_SERV_NAME
-> SELECT * from PD_MASTER_DICT
-> ```
->
-> （2）入库去向
->
-> ```java
-> 新增接口：IPdSvcDictAoSvc_insertPdSvcDict 
-> ```
->
-> #### 入表 **<font color='#900000'>PD_SVC_DICT</font>** ，其中**服务类型**入字段**<font color='#900000'>SVC_TYPE</font>**,**主体服务类型**入字段<font color='#900000'>MASTER_SERV_ID</font>，授权大小入字段**<font color='#900000'>SVC_VERSION</font>**，服务标识入字段<font color='#900000'>SVC_ID</font>，服务名称入字段<font color='#900000'>SVC_NAME</font>
+### 4.1 导入依赖
 
-### 1.2.2 服务指令
+```xml
+<!--指定 jdk 编译版本-->
+<build>
+ 	<plugins>
+ 		<plugin>
+ 			<groupId>org.apache.maven.plugins</groupId>
+ 			<artifactId>maven-compiler-plugin</artifactId>
+ 			<configuration>
+ 				<source>8</source>
+ 				<target>8</target>
+ 			</configuration>
+ 		</plugin>
+ 	</plugins>
+</build>
+<dependencies>
+ 	<!--rabbitmq 依赖客户端-->
+ 	<dependency>
+ 		<groupId>com.rabbitmq</groupId>
+ 		<artifactId>amqp-client</artifactId>
+ 		<version>5.8.0</version>
+ 	</dependency>
+ 	<!--操作文件流的一个依赖-->
+ 	<dependency>
+ 		<groupId>commons-io</groupId>
+ 		<artifactId>commons-io</artifactId>
+ 		<version>2.6</version>
+ 	</dependency>
+</dependencies>
+```
 
-> （1）取值来源
->
-> 网元查询：
->
-> ```mysql
-> select * from PD_DYNSRV_DICT where SVC_NAME = 'sQryHlrCodeAoSvc';
-> # 口径：
-> SELECT DISTINCT HLR_CODE,DEVICE_NAME FROM PD_DEVICECMDTYPEHLR_DICT ORDER BY HLR_CODE
-> ```
->
-> 根据网元动态查询开关机指令：
->
-> ```mysql
-> 查询接口：IPdCommandCodeDictAoSvc_qryCommandCodeDictListByHlrCode
-> # 口径
-> SELECT COMMAND_CODE,COMMAND_NAME,HLR_CODE FROM PD_COMMANDCODE_DICT 
-> WHERE BINARY HLR_CODE = 'c'  ORDER BY COMMAND_CODE DESC
-> ```
->
-> （2）入库去向
->
-> #### 入表 `PD_SRVCMDRELAT_REL`，其中<font color='#900000'>服务标识</font>入字段`SERVICE_CODE`，<font color='#900000'>网元</font>入字段`SRV_NET_TYPE`，<font color='#900000'>开机指令</font>入字段`ON_CMD`，<font color='#900000'>开机指令ID</font>入字段`ON_CTRL_CODE`,<font color='#900000'>关机指令</font>入字段`OFF_CMD`，<font color='#900000'>关机指令ID</font>入字段`OFF_CTRL_CODE`
->
-> ```sql
-> select SRV_NET_TYPE 网元,ON_CMD 开机指令,ON_CTRL_CODE 开机指令ID,OFF_CMD 关机指令,OFF_CTRL_CODE关机费用ID from PD_SRVCMDRELAT_REL where SERVICE_CODE = ''
-> ```
->
-> 
-
-### 1.2.3 服务与频道关系
-
-> （1）取值来源
->
-> ```mysql
-> 暂无
-> ```
->
-> （2）入库去向
->
-> #### 入表 `PD_SVCCHANNEL_REL`,其中<font color='#900000'>频道代码</font>入字段`CHN_CODE`，<font color='#900000'>频道名称</font>入字段`CHN_NAME`，<font color='#900000'> TV名称</font>入字段`TV_NAME`
-
-### 2.1 查询口径
-
-> 接口：
->
-> ```java
-> com_sitech_pgcenter_atom_inter_IPdSvcDictAoSvc_qrySvcDict
-> ```
->
-> 口径：
->
-> ```mysql
-> SELECT A.SVC_ID, A.SVC_NAME, A.SVC_COMMENTS, A.SVC_TYPE, A.MASTER_SERV_ID, B.MASTER_SERV_NAME, A.CREATE_LOGIN, A.OP_TIME, A.EFF_DATE, A.EXP_DATE, A.STATE, A.SVC_VERSION 
-> FROM PD_SVC_DICT A LEFT JOIN pd_master_dict B ON A.MASTER_SERV_ID = B.MASTER_SERV_ID 
-> WHERE A.TENANTID = '51' 
-> ORDER BY A.CREATE_DATE DESC
-> LIMIT 20;
-> 
-> ```
->
-> 
-
-## ★<font color='#900000'>P321-产品配置</font>
-
-### 1.1 页面索引
+### 4.2 抽取工具类
 
 ```java
-起始页：pgcmng_op_web_view/pgcmng-base-app/npage/busi/gdfamily/P001/P001.html
-新增页：pgcmng_op_web_view/pgcmng-base-app/npage/busi/gdfamily/P001/P001_insert.html
-js: pgcmng_op_web_view/pgcmng-base-app/nresource/assets/js/busi/gdfamily/P001/P001_insert.js
-创建接口：IProductAoSvc_insert
-修改接口：IUpdateProdInfoAoSvc_updateProdInfo
-删除接口：IDeleteProdInfoAoSvc_deleteProdInfo
+public class RabbitMqUtils {
+ 	//得到一个连接的 channel
+ 	public static Channel getChannel() throws Exception{
+ 		//创建一个连接工厂
+ 		ConnectionFactory factory = new ConnectionFactory();
+ 		factory.setHost("182.92.234.71");
+ 		factory.setUsername("admin");
+ 		factory.setPassword("123");
+ 		Connection connection = factory.newConnection();
+ 		Channel channel = connection.createChannel();
+ 		return channel;
+ 	}
+}
 ```
 
-### 1.2  取值与入库
+### 4.3 轮训分发(默认方式)
 
-#### 1.2.1 产品基本信息
-
-> #### 入表 `PD_PROD_DICT (产品基本信息表)`,其中<font color='#900000'>产品编码</font>入字段`PROD_ID`，<font color='#900000'>产品编码</font>入字段`PROD_TYPE`，<font color='#900000'>产品名称</font>入字段`PROD_NAME`，<font color='#900000'>产品状态（A:已发布，X:已注销，H:未发布）</font>入字段`STATE`，<font color='#900000'>产品类型</font>入字段`PROD_TYPE`
-
-#### 1.2.2 业务类型
-
-> #### （1）取值来源
->
-> **`PD_BUSITYPE_DICT`**（业务类型定义表）
->
-> ```mysql
-> 接口：ProductAoSvc_queryAllBusitype
-> # 取值口径
-> SELECT BUSITYPE,BUSINAME FROM PD_BUSITYPE_DICT ORDER BY BUSIORDER ASC
-> ```
->
-> #### （2）入库去向
->
-> ```java
-> 新增接口：IProductAoSvc_insert
-> 修改接口：IUpdateProdInfoAoSvc_updateProdInfo
-> ```
->
-> #### <font color='#900000'>业务类型</font>：<font color='#900000'>业务类型不为空</font>，入表 `PD_PRODBUSITYPE_REL（产品业务关系表） `，入字段`BUSITYPE`
-
-#### 1.2.3 产品服务关系
-
-> #### （1）取值来源
->
-> ```mysql
-> 接口：IPdSvcDictAoSvc_qrySvcDict
-> # 口径说明：只查询存在主题服务类型的服务
-> select
-> 	A.SVC_ID,
-> 	A.SVC_NAME,
-> 	A.SVC_COMMENTS,
-> 	A.SVC_TYPE,
-> 	A.MASTER_SERV_ID,
-> 	B.MASTER_SERV_NAME,
-> 	A.CREATE_LOGIN,
-> 	A.OP_TIME,
-> 	A.EFF_DATE,
-> 	A.EXP_DATE,
-> 	A.STATE,
-> 	A.SVC_VERSION
-> from
-> 	PD_SVC_DICT A,
-> 	pd_master_dict B
-> where
-> 	A.MASTER_SERV_ID = B.MASTER_SERV_ID
-> ```
->
-> #### （2）入库去向
->
-> ```
-> 新增接口：IProductAoSvc_insert
-> 修改接口：IUpdateProdInfoAoSvc_updateProdInfo
-> ```
->
-> ### 入表 `PD_PRODSVC_REL (产品与服务关系表)`，其中<font color='#900000'>服务ID</font>入字段`SVC_ID`，<font color='#900000'>产品ID</font>入字段`PROD_ID`
->
-> #### 注：一个产品可包含多个服务，但这些服务的<font color='#900000'>主题服务类型</font>必须相同，**`主题服务类型`**入表`PD_PROD_DICT（产品定义表）`，入字段 `MASTER_SERV_ID`
-
-### 2.1 查询口径
-
-> 接口：
->
-> ```java
-> ISearchProdInfoListAoSvc_searchProdInfoList
-> ```
-
-## ★<font color='#900000'>P321-单商品配置</font>
-
-### 1.1 页面索引
+#### 4.3.1 生产者
 
 ```java
-起始页：pgcmng_op_web_view/pgcmng-base-app/npage/busi/gdfamily/P016/P016.html
-新增页：pgcmng_op_web_view/pgcmng-base-app/npage/busi/gdfamily/P016/P016_goodsInfo.html
-js: pgcmng_op_web_view/pgcmng-base-app/nresource/assets/js/busi/gdfamily/P016/P016_goodsInfo.js
-创建接口：ICreateGoodsAndProdRelCoSvc_createGoodsAndProdRel
-修改接口：ICreateGoodsAndProdRelCoSvc_updateGoodsAndProdRel
-删除接口：ICreateGoodsAndProdRelCoSvc_deleteGoodsAndProdRel
-新增后数据库校验：
-# 商品基本信息
-select * from pd_goods_DICT where GOODS_ID = 'G12431'
-# 商品销售目录树
-select CATA_ITEM_ID DOODS_ID,CATA_ID from PD_GOODSCATAITEM_DICT where CATA_ITEM_ID = 'G12431'
-# 业务品牌
-select GOODS_ID,BRAND_ID from PD_GOODSBRAND_REL where GOODS_ID = 'G12431'
-# 商品产品关系
-select * from pd_goodsprod_rel where GOODS_ID  = 'G12431'
-# 商品属性
-select * from pd_goodsattr_dict where GOODS_ID = 'G12431'
+public class Producer {
+    //定义队列名称
+    private final static String QUEUE_NAME = "hello";
+
+    public static void main(String[] args) throws Exception{
+        //创建连接工厂
+        Channel channel = RabbitMQUtil.getChannel();
+        /*
+        * 生成一个队列
+        * 1. 队列名称
+        * 2. 队列里面的消息是否持久化
+        * 3. 该队列是否只供一个消费者进行消费,是否进行共享 true:可以多个消费者消费
+        * 4. 是否自动删除,最后一个消费者端开连接以后该队列是否自动删除 true:自动删除
+        * 5. 其他参数
+        * */
+        channel.queueDeclare(QUEUE_NAME,true,false,false,null);
+        //要发送的消息
+        String message="hello world";
+        /*
+         * 发送一个消息
+         * 1.发送到那个交换机
+         * 2.路由的 key 是哪个
+         * 3.其他的参数信息
+         * 4.发送消息的消息体
+         * */
+        channel.basicPublish("",QUEUE_NAME,null,message.getBytes(StandardCharsets.UTF_8));
+        System.out.println("消息发送完毕");
+    }
+}
 ```
 
-### 1.2 取值与入库
-
-#### 1.2.1 商品基本属性
-
-> #### 入表 `PD_GOODS_DICT (商品信息表)`，其中<font color='#900000'>商品ID</font>入字段`GOODS_ID`，<font color='#900000'>商品名称</font>入字段`GOODS_NAME`，<font color='#900000'>商品类型（0:主商品，1:附加商品）</font>入字段`GOODS_TYPE`，<font color='#900000'>商品状态</font>入字段`STATE`，<font color='#900000'>商品描述</font>入字段`GOODS_DESC`，**<font color='#900000'>受理单描述</font>**入字段`REMARK`，<font color='#900000'>商品打包类型（0:原子商品，1:融合商品）</font>入字段`COM_FLAG`
-
-#### 1.2.2 商品销售目录树	
-
-> #### （1）取值来源
->
-> ```mysql
-> 顶级节点查询接口：IPdGoodscataDictAoSvc_queryPdGoodscataDictList
-> 口径：
-> SELECT CATA_ID,CATA_NAME FROM PD_GOODSCATA_DICT WHERE BASE_CATA_FLAG ='A'
-> 
-> 查询子节点接口：IPdGoodscataDictAoSvc_qryGoodsCata
-> # 主要字段：CATA_ID当前节点，PAR_CATA_ID父节点
-> SELECT  A.CATA_ID,
-> B.PAR_CATA_ID,
-> A.CATA_NAME,
-> B.CATA_LEVEL
-> FROM 
-> 	    PD_GOODSCATA_DICT A,PD_GOODSCATA_REL B
-> WHERE  
-> 		A.CATA_ID=B.CATA_ID 
-> 		and B.CATA_LEVEL = '1'
-> 		and B.CATA_ID != B.PAR_CATA_ID
-> 		and B.PAR_CATA_ID = #{cataId}
-> ```
->
-> #### （2）入库去向
->
-> 新增: 
->
-> ```java
-> 调用接口：ICreateGoodsAndProdRelCoSvc_createGoodsAndProdRel
-> ```
->
-> 入表**<font color='#900000'>PD_GOODSCATAITEM_DICT</font>** **商品标识(GOODS_ID)**入字段**<font color='#900000'>CATA_ITEM_ID</font>**,**目录树节点标识(CATA_ID)**入字段**<font color='#900000'>CATA_ID</font>**
->
-> 修改：
->
-> ```java
-> 调用接口：ICreateGoodsAndProdRelCoSvc_updateGoodsAndProdRel
-> ```
->
-> 复制：
->
-> ```java
-> 调用接口：ICreateGoodsAndProdRelCoSvc_updateGoodsAndProdRel
-> ```
-
-#### 1.2.3 业务品牌
-
-> #### （1）取值来源
->
-> ```mysql
-> 取值接口：select * from PD_DYNSRV_DICT where SVC_NAME in ('getBrandList');
-> # 口径：
-> SELECT BRAND_ID,BRAND_NAME,PAR_BRAND_ID,BRAND_DESC
-> FROM PD_BRAND_DICT
-> WHERE BRAND_ID IN ('a0','b0','b1','b2','d1','n1','n2')
-> ```
->
-> #### （2）入库去向
->
-> 入表**<font color='#900000'>PD_GOODSBRAND_REL</font>** **商品标识(GOODS_ID)**入字段**<font color='#900000'>GOODS_ID</font>**,**品牌标识**入字段**<font color='#900000'>BRAND_ID</font>**
-
-#### 1.2.4 商品账本
-
-> 1. ##### 商品账本
->
-> （1）取值来源
->
-> ```json
-> 本地接口：IOutBillingInterCoSvc_accountAdd
-> 接口： http://acctmgr-service-fund/com_sitech_acctmgr_inter_pay_ProdPayTypeSvc_add
-> ```
->
-> （2）入库去向
->
-> #### <font color='#900000'>入库去向</font>：`同商品附加属性`，只不过，商品账本的属性ID为固定<font color='#900000'>10117</font>，
->
-> #### `DEVALUE_VALUE`为返回参数中的`PAY_TYPE`
->
-> 1. ##### 商品赠送账本
->
-> （1）取值来源
->
-> ```java
-> 
-> ```
->
-> （2）入库去向
->
-> #### <font color='#900000'>入库去向</font>：`同商品附加属性`，商品赠送账本的属性值为固定<font color='#900000'>103002</font>
->
-> 
-
-#### 1.2.5 协议期标识
-
-> #### 入库去向：
->
-> ##### （非）协议期标识，入表`PD_GOODS_DICT`字段`MODIFY_FLAG`，订购单位入表`PD_TIMERULE_DICT (时间规则配置信息表)`入字段`OFFSET_UNIT`，协议期长度入字段`OFFSET_CYCLE`,
->
-> ##### 两表通过`	PD_GOODS_DICT`的`EXP_RULE_ID`字段和`PD_TIMERULE_DICT`表的`RULE_ID`字段进行关联。
->
-> ```
-> 00 协议期
-> 01 非协议期 EXP_RULE_ID:1023 
-> ```
->
-> ```mysql
-> select a.MODIFY_FLAG 协议期标识,b.OFFSET_UNIT 订购单位,b.OFFSET_CYCLE 协议期长度
-> from  pd_goods_dict a,PD_TIMERULE_DICT b
-> where a.EXP_RULE_ID  = b.RULE_ID 
-> and a.GOODS_ID = '商品标识'
-> ```
-
-#### 1.2.6 商品附加属性
-
-> #### （1）取值来源
->
-> ```mysql
-> select * from PD_DYNSRV_DICT where SVC_NAME = 'getAttrList';
-> # 口径
-> SELECT A.ATTR_ID,A.VAR_NAME,A.ATTR_TYPE,A.CONTROL_TYPE,A.CONF_REMARK,A.DISP_TYPE,A.CTRL_CODE
-> FROM PD_ATTRCTRL_DICT A
-> WHERE A.ATTR_TYPE IN ('1','12','13','123') 
-> ```
->
-> #### （2）入库去向
->
-> **商品属性显隐性关系以及功能代码入表 `PD_SEGMENTATTRLMT_REL`（商品、定价属性显隐性、功能代码关系表），其中**
->
-> OBJECT_TYPE： 对象类型0:不区分按照属性标识限制，1：商品定价，2：服务标识，3：商品标识;
->
-> OBJECT_ID：对象标识，类型配置0时，配置Z，OBJECT_TYPE=1：存定价，OBJECT_TYPE=2：服务标识，OBJECT_TYPE=3：商品标识;
->
-> ATTR_ID： 属性标识;
->
-> SEGMENT： 功能代码
->
-> DISP_TYPE：是否展示，Y：允许，N：不允许;
->
-> ##### 属性值入表`PD_GOODSATTR_DICT (商品属性表)`，商品标识入字段`GOODS_ID`，属性标识入字段`ATTR_ID`，
->
-> ##### <font color='#900000'>属性值</font>入字段`ATTR_VAL`，属性名称入字段`ATTR_NAME`
->
-> ### (3) 商品属性初始化
->
-> ```sql
-> 接口：IPdGoodsRelAoSvc_queryAttrByGoodsId
-> 口径：
-> 		SELECT
-> 			A.GOODS_ID,
-> 			A.ATTR_ID,
-> 			A.ATTR_NAME,
-> 			A.ATTR_DESC,
-> 			A.DEFAULT_VALUE,
-> 			B.CTRL_CODE,
-> 			B.DISP_TYPE
-> 		FROM
-> 			PD_GOODSATTR_DICT A,
-> 			PD_ATTRCTRL_DICT B
-> 		WHERE
-> 			A.ATTR_ID = B.ATTR_ID
-> 		  AND B.ATTR_TYPE in ('1','2','3','12','13','23','123')
-> 		  AND A.GOODS_ID = #{GOODS_ID}
-> ```
->
-> 
-
-#### 1.2.7 商品产品关系
-
-> #### （1）取值来源
->
-> ```java
-> 接口：ISearchProdInfoListAoSvc_searchProdInfoList
-> ```
->
-> #### （2）入库去向
->
-> ##### 入表`PD_GOODSPROD_REL (商品产品关系表)`，商品标识入字段`GOODS_ID`，产品标识入字段`PROD_ID`
-
-#### 1.2.8 商品预授权区域配置
-
-> #### （1）触发条件
->
-> ##### 	当附加属性选择属性标识是 `20050` ，后会触发商品预授权区域配置
->
-> #### （1）取值来源
->
-> ```java
-> 同 单商品定价发布 -> 客户配置区域
-> ```
->
-> #### （2）入库去向
->
-> ##### 入表 **`PD_GOODSRELEASE_DICT（发布信息表）`** ，其中商品标识入字段`GOODS_ID`，PRC_ID为固定值`"F"`,预授权区域标识入字段 **`GROUP_ID`** ，`CHANNEL_TYPE = 'Z'`，`CTRL_CODE = 'Z'` ，每增加一个预授权区域就增加一条记录。
-
-### 1.3 初始化说明
-
-> #### 1.商品基本信息初始化
->
-> （1）查询商品基本信息
->
-> ```mysql
-> 查询商品基本信息接口：IPdGoodsDictAoSvc_queryGoodsById
-> 口径：select * from PD_GOODS_DICT where GOODS_ID = 'goodsId'
-> ```
->
-> （2）查询商品产品关系
->
-> ```sql
-> 接口：IPdGoodsprodRelAoSvc_qryByGoodsId
-> 口径：select * from PD_GOODSPROD_REL where GOODS_ID = 'goodsId' and tenantid = 'goodsId'
-> ```
->
-> #### 2.产品信息
->
-> （1）查询产品
->
-> ```mysql
-> 接口：ISearchProdInfoListAoSvc_searchProdInfoList
-> 口径：select * from PD_PROD_DICT where PROD_ID = 'prodId'
-> ```
->
-> （2）查询产品服务关系
->
-> ```mysql
-> 接口：ISearchProdInfoListAoSvc_qryProdSvcList
-> 口径：        
-> SELECT
-> A.PROD_ID,A.SVC_ID,B.SVC_NAME,B.SVC_TYPE,B.MASTER_SERV_ID,C.MASTER_SERV_NAME,B.SVC_COMMENTS,A.SEL_FLAG,A.EFF_DATE,A.EXP_DATE,A.GROUP_ID,A.CREATE_DATE,A.CREATE_LOGIN,A.VERSION
-> FROM PD_PRODSVC_REL A JOIN PD_SVC_DICT B ON A.SVC_ID = B.SVC_ID
-> LEFT JOIN PD_MASTER_DICT C  ON C.MASTER_SERV_ID = B.MASTER_SERV_ID
-> WHERE A.PROD_ID = #{prodId}
-> AND A.TENANTID = #{tenantid}
-> ```
->
-> #### 3.服务信息
->
-> （1）查询服务
->
-> ```mysql
-> 接口：IPdSvcDictAoSvc_qrySvcDict
-> 口径：SELECT	A.SVC_ID,
->           A.SVC_NAME,
->           A.SVC_COMMENTS,
->           A.SVC_TYPE,
->           A.MASTER_SERV_ID,
->           B.MASTER_SERV_NAME,
->           A.CREATE_LOGIN,
->          A.OP_TIME,
->           A.EFF_DATE,
->          A.EXP_DATE,
->           A.STATE,
->          A.SVC_VERSION
->   FROM PD_SVC_DICT A LEFT JOIN pd_master_dict B
->   ON A.MASTER_SERV_ID = B.MASTER_SERV_ID
->   WHERE A.TENANTID = #{tenantid}
->      AND A.SVC_ID = #{svcId}
-> ```
->
-> （3）查询服务指令关系
->
-> ```mysql
-> 接口：IPdSvcDictAoSvc_qrySrvCmdRelList
-> 口径：select * from PD_SRVCMDRELAT_REL where SVC_ID = 'svcId'
-> ```
->
-> 
-
-1.3 销售品（单商品）分析
-
-```sql
--- 分析销售品组成、看是否需要新建账务资费、是否需要新建服务或产品或销售品
--- 1/1------配置【销售品】GOODS_ID，注意先去找是否已经存在相同授权的销售品，若有存在则用回
--- 1/1、1---按【资费】PRC_ID找【销售品】GOODS_ID名字  
-select distinct A.PRC_ID "资费ID",A.PRC_NAME "资费名称",C.GOODS_ID "商品ID",C.GOODS_NAME "商品名称",
-A.`STATE` "资费状态",C.COM_FLAG "商品打包类型",C.GOODS_TYPE "商品类型",A.EFF_DATE "定价生效时间",A.EXP_DATE "定价失效时间",C.EFF_DATE "商品生效时间",C.EXP_DATE "商品失效时间"
-from PD_GOODSPRC_DICT A,PD_GOODS_DICT C
-Where A.GOODS_ID = C.GOODS_ID
-and A.PRC_NAME like CONCAT('%','甜果','%')  and A.PRC_NAME like CONCAT('%','59','%') and A.PRC_NAME like CONCAT('%','20年','%')
-and C.GOODS_NAME like CONCAT('%','甜果','%')  and C.GOODS_NAME like CONCAT('%','59','%') and C.GOODS_NAME like CONCAT('%','20年','%')
-and A.PRC_ID in ('X2636')
-and C.GOODS_ID in ('GZ126607')
-and C.COM_FLAG = '0' -- 0原子商品，1融合（组合）商品
-and C.GOODS_TYPE = '0' -- 0主商品，1附加商品
-and A.`STATE` in ('A','S') -- A资费已发布，S资费待审核，X已下架
-and sysdate() between C.eff_date and C.exp_date
-and C.EXP_DATE >= ('2022-10-01 23:59:59')
-```
-
-1.4  查询商品(销售品)下对应的产品、服务、主题服务类型、网元、开机指令、关机指令 
-
-```mysql
--- 查询商品(销售品)下对应的产品、服务、主题服务类型、网元、开机指令、关机指令 
-select
-	B.GOODS_ID "商品标识", B.GOODS_NAME "商品名称", A.PROD_ID "产品标识", E.PROD_NAME "产品名称",
-	C.SVC_ID "服务标识", F.SVC_NAME "服务名称", F.MASTER_SERV_ID "主题服务类型", G.MASTER_SERV_NAME "主题服务名称",
-	D.SRV_NET_TYPE "网元", D.ON_CMD "开机指令", D.ON_CTRL_CODE "开机码", D.OFF_CMD "关机指令", D.OFF_CTRL_CODE "关机码"
-from pd_goods_dict B left join PD_GOODSPROD_REL A 
-on A.GOODS_ID = B.GOODS_ID left join PD_PROD_DICT E 
-on A.PROD_ID = E.PROD_ID left join PD_PRODSVC_REL C 
-on E.PROD_ID = C.PROD_ID left join pd_svc_dict F 
-on C.SVC_ID = F.SVC_ID left join pd_master_dict G
-on F.MASTER_SERV_ID = G.MASTER_SERV_ID left join PD_SRVCMDRELAT_REL D
-on F.SVC_ID = D.SERVICE_CODE
-where
-	B.GOODS_ID = 'GZ129845'
-	-- and (B.GOODS_NAME = '甜果-月享(时移回看+付费频道+newTV+随心录多屏+甜果4K)' or B.GOODS_ID = 'GZ126529')
-```
-
-## ★<font color='#900000'>P321-单商品定价配置</font>
-
-### 1.1 起始页
+#### 4.3.2 消费者
 
 ```java
-起始页：pgcmng_op_web_view/pgcmng-base-app/npage/busi/gdfamily/P254/P254.html
-定价信息创建接口：IPdGoodsprcDictAoSvc_create
-修改接口：IPdGoodsprcDictAoSvc_updatePrc
-删除接口：IPdGoodsprcDictAoSvc_deleteGoodsPrc
+public class Customer {
+    //定义队列名称
+    private final static String QUEUE_NAME = "hello";
+
+    public static void main(String[] args) throws Exception{
+        //创建连接工厂
+        Channel channel = RabbitMQUtil.getChannel();
+        //推送的消息如何进行消费的接口回调
+        DeliverCallback deliverCallback = (var1,var2) ->{
+            String message = new String(delivery.getBody(), StandardCharsets.UTF_8);
+            System.out.println("成功接受消息" + );
+        };
+        //取消消费的一个回调接口 如在消费的时候队列被删除掉了
+        CancelCallback cancelCallback = (var1) ->{
+            System.out.println("接受消息失败");
+        };
+        /*
+         * 消费者消费消息
+         * 1.消费哪个队列
+         * 2.消费成功之后是否要自动应答 true 代表自动应答 false 手动应答
+         * 3.成功的回调
+         * 3.消费者未成功消费的回调
+         * */
+        String s = channel.basicConsume(QUEUE_NAME, true, deliverCallback, cancelCallback);
+    }
+}
 ```
 
-### 1.2 取值与入库
+### 4.4 消息应答（消费者方）
 
-#### 1.2.1 商品信息
+#### 4.4.1 自动应答：
 
-> #### （1）取值来源
->
-> ```mysql
-> 接口：IServiceOfGoodsInfoAoSvc_qryOfPages
-> # 主要字段：GOODS_ID
-> SQL: select * from PD_GOODS_DICT where COM_FLAG = '0'
-> ```
->
-> #### （2）入库去向
->
-> 新增:
->
-> ```java
-> 调用接口：IPdGoodsprcDictAoSvc_create
-> ```
->
-> 入表**<font color='#900000'>PD_GOODSPRC_DICT（商品定价信息表）</font>** **商品标识**入字段**<font color='#900000'>GOODS_ID</font>**，**定价标识**入字段**<font color='#900000'>PRC_ID</font>**，**定价名称**入字段**<font color='#900000'>PRC_NAME</font>**，**定价描述**入字段**<font color='#900000'>GOODS_PRC_DESC</font>**
+​		消息发送后立即被认为已经传送成功。（**<font color='#900000'>不安全</font>**）
 
-#### 1.2.2 第三方SP互联网销售品
+#### 4.4.2 手动应答：
 
-> 配置第三方SP互联网销售品，需在商品附加属性添加相对应的属性类型(第三方SP互联网销售品采用不同属性ID区分)，
-> 配置定价时使用动态SQL判断定价所属商品的附加属性是否包含第三方SP互联网销售品，方便后期动态增删维护，
-> 若商品包含SP互联网销售品属性，在配置商品定价时动态添加外部商品授权码，存入PD_OUTGOODS_REL表，其中外部商品编码存入OUT_GOODS_ID字段，第三方SP互联网销售品对应的附件属性ID存入BIZ_CODE字段，商品ID存入GOODS_ID字段，定价ID存入PRC_ID字段。
->
-> （1）动态SQL:
->
-> ```sql
-> select * from PD_DYNSRV_DICT where SVC_NAME = 'getAllPrcClass';
-> # 口径
-> SELECT A.ATTR_ID,B.VAR_NAME
-> FROM PD_GOODSATTR_DICT A,PD_ATTRCTRL_DICT B 
-> WHERE A.ATTR_ID = B.ATTR_ID 
-> AND A.ATTR_ID  IN ('10402','10403','10404','10405','10408','10409')
-> AND A.GOODS_ID = #QRY_PARAM#
-> 
-> ```
->
-> 
+​	消费者在接收到消息**<font color='#900000'>并且</font><font color='#900000'>处理</font>**该消息之后，告诉 rabbitmq 它已经处理了，rabbitmq 可以把该消息删除了。
 
-#### 1.2.3 客户类型
+#### 4.4.3 消息应答的方法
 
-> #### （1）取值来源
->
-> ```mysql
-> 接口：IPdAttrValDictAoSvc_qryCustomerAndCardVal
-> # 主要字段：ELEMENT_VALUE
-> SELECT
-> A.ELEMENT_VALUE, A.ELEMENT_VALUE_NAME
-> FROM PD_ATTRVAL_DICT A, PD_ATTRCTRL_DICT B
-> WHERE B.ATTR_ID=A.ELEMENT_ID
-> AND B.ATTR_ID = '10020'
-> ```
->
-> #### （2）入库去向
->
-> **<font color='#900000'>注意</font>**：入库去向**<font color='#900000'>同普通附加属性</font>**，客户类型占用固定属性值**`10020`**
+1. Channel.basicAck(用于肯定确认) ：RabbitMQ 已知道该消息并且成功的处理消息，可以将其丢弃了 
+2. Channel.basicNack(用于否定确认)
+3. Channel.basicReject(用于否定确认)
 
-#### 1.2.4 主副端标识
+### 4.5 发布确认（生产者方）
 
-> #### （1）取值来源
->
-> ```mysql
-> 接口：IPdAttrValDictAoSvc_qryCustomerAndCardVal
-> # 主要字段：ELEMENT_VALUE
-> SELECT
-> A.ELEMENT_VALUE, A.ELEMENT_VALUE_NAME
-> FROM PD_ATTRVAL_DICT A, PD_ATTRCTRL_DICT B
-> WHERE B.ATTR_ID=A.ELEMENT_ID
-> AND B.ATTR_ID = '10040'
-> ```
->
-> #### （2）入库去向
->
-> **<font color='#900000'>注意</font>**：入库去向**<font color='#900000'>同普通附加属性</font>**，主副端标识占用固定属性值**`10040`**
+#### 4.5.1 开启发布确认
 
-#### 1.2.4 用户属性配置
+​		 发布确认默认是没有开启的，如果要开启需要调用方法 confirmSelect，每当你要想使用发布 确认，都需要在 channel 上调用该方法。
 
-> #### （1）取值来源
->
-> ```mysql
-> 接口：IPdAttrValDictAoSvc_qryCustomerAndCardVal
-> # 主要字段：ELEMENT_VALUE
-> SELECT
-> 			A.ELEMENT_VALUE, A.ELEMENT_VALUE_NAME
-> 		FROM PD_ATTRVAL_DICT A, PD_ATTRCTRL_DICT B
-> 		WHERE B.ATTR_ID=A.ELEMENT_ID
-> 		AND B.ATTR_ID = '20084'
-> ```
->
-> #### （2）入库去向
->
-> **<font color='#900000'>注意</font>**：入库去向**<font color='#900000'>同普通附加属性</font>**，用户属性配置占用固定属性值**`20084`**
+#### 4.5.2 单个确认发布：
 
-#### 1.2.5 营业费用(一次性费用)信息
-
-> #### （1）取值来源
->
-> ```java
-> 一级项费用接口：IOrFeecodeDictAoSvc_queryFirstFee
->  外部接口（受理）：http://crm-cbn-home-query/api/b830/b830Qry
-> 费用编码：FEE_CATALOG
-> 费用名称：CATALOG_NAME + OP_NOTE
-> 费用类型：未传，默认为0
-> 二级项费用接口：IOrFeecodeDictAoSvc_querySecondFee
->  外部接口（受理）：http://crm-cbn-home-query/api/b829/sb829Qry
-> 费用编码：FEE_CODE
-> 费用名称：FEE_NAME + SM_NAME + OP_CODE_NAME + RES_TYPE_NAME
-> 费用类型：FEE_TYPE
-> ```
->
-> #### （2）入库去向
->
-> ```java
-> 新增接口：IPdGoodsprcfeeRelAoSvc_createOrUpdate
-> ```
->
-> ##### 入表**`PD_GOODSPRCFEE_REL`<font color='#900000'>一次性费用项ID</font>存入字段`FEE_CODE`,一次性费用**值（金额）存入字段为**`FEE_VALUE`**，一次性费用类型入字段`FEE_TYPE`，一次性费用名称入字段`REMARK`，定价标识入字段`PRC_ID`，其中`PRC_EFF_ID `自增
-
-#### 1.2.6 资费构成信息（账务）
-
-> #### （1）取值来源
->
-> ```java
-> //根据定价查询资费构成接口
-> 本地接口：IOutBillingInterCoSVC_queryPrcFee
-> SpringCloud调用外部接口：
-> http://10.215.160.150:30193/acctmgr-service-crminfo/com_sitech_acctmgr_crminfo_config_IConfigServiceSvc_getProdPrcMsg
-> ```
->
-> #### （2）入库去向
->
-> ```java
-> 增加定价与资费构成关系接口：IOutBillingInterCoSvc_prcFeeAdd
-> 外部接口：http://acctmgr-service-fund/com_sitech_acctmgr_inter_pay_ProdPrcSvc_config
-> 查询定价与资费构成关系接口：IOutBillingInterCoSVC_queryPrcFee
-> 
-> ```
-
-#### 1.2.7 定价计费(元)周期性费用(账本)
-
-> #### （1）取值来源
->
-> #### （2）入库去向
->
-> ```java
-> 周期性费用(账本)：ATTR_ID = 10062
-> 周期性费用(账本)占用固定属性值10062
-> ```
->
-> 入表**`PD_GOODSPRCATTR_DICT`**入的字段为**`ATTR_ID`**，只记录该定价包含哪些属性，每一种属性占据一条记录，
->
-> 而**`周期性费用(账本)值`**记录在表**`PD_GOODSPRCATTRLMT_REL`**中，其中字段**`ATTR_ID=10062`**，**`ATTR_VALUE`**记录属性值（周期性费用），**`GROUP_ID`**记录月租规则（**`RULE_ID`**），**`ATTR_TYPE`**记录资费分类(**`SOURCE_TYPE`**)，每个属性值占据一条记录。
-
-#### 1.2.8 定价附加属性列表
-
-> #### （1）取值来源
->
-> ```mysql
-> select * from PD_DYNSRV_DICT where SVC_NAME = 'getAttrctrl';
-> # ATTR_ID
-> #口径（使用）
-> SELECT A.ATTR_ID,A.VAR_NAME,A.ATTR_TYPE,A.CONF_REMARK,A.DISP_TYPE,A.CTRL_CODE,A.CONTROL_TYPE
-> FROM PD_ATTRCTRL_DICT A
-> WHERE A.ATTR_TYPE IN ('2','12','23','123')
-> ```
->
-> #### （2）入库去向
->
-> ```java
-> 调用接口：IPdGoodsprcDictAoSvc_create
-> ```
->
-> 入表**`PD_GOODSPRCATTR_DICT`**入的字段为**`ATTR_ID`**，只记录该定价包含哪些属性，每一种属性占据一条记录，
->
-> 而**`定价属性值`**记录在表**`PD_GOODSPRCATTRLMT_REL`**中，字段**`ATTR_ID`**以及**`ATTR_VALUE`**每个属性值占据一条记录。
->
-> #### （3）初始化属性列表
->
-> ```java
-> 接口：goodsPrcAttrLmtRel_queryByPrcId = IPdGoodsprcattrlmtRelAoSvc_queryByPrcId
-> ```
->
-> ```sql
-> #批量添加合同：
-> select * from PD_GOODSPRCATTR_DICT where ATTR_ID = '10021' and PRC_ID in ('X3123','120717','X2831','120300','124268','121790','125567','128490');
-> delete From PD_GOODSPRCATTR_DICT where ATTR_ID = '10021' and PRC_ID in ('X3123','120717','X2831','120300','124268','121790','125567','128490');
-> INSERT INTO `pd_goodsprcattr_dict` (`PRC_ID`, `ATTR_ID`, `ATTR_NAME`, `ATTR_DESC`, `MIN_VALUE`, `MAX_VALUE`, `STATE`, `STATE_DATE`, `BILL_SEND_FLAG`, `IF_DEFAULT_VALUE`, `SHOW_ORDER`, `CREATE_DATE`, `EFF_DATE`, `EXP_DATE`, `DEFAULT_VALUE`, `PASS_WAY`, `CHECK_FLAG`, `EXPRESSION`, `PRINT_FLAG`, `EFF_RULE_ID`, `CHG_FLAG`, `GRP_NO`, `GROUP_ID`, `USE_RANGE`, `CREATE_LOGIN`, `VERSION`, `TENANTID`, `LOGIN_ACCEPT`, `OP_TIME`, `LOGIN_NO`, `REMARK`) 
-> select distinct PRC_ID, '10021', '合同', '合同', '1', '1', 'A', '2022-09-23 17:47:21', 'F', 'F', NULL, '2022-09-23 17:47:21', '2022-08-29 00:00:00', '2099-12-31 00:00:00', '0', '0', 'Y', NULL, 'N', '1001', 'N', '0', '440000', 'Z ', 'gdcs02', '1.0', '44', '16200', '2022-09-23 17:47:21', 'gdcs02', null
-> from pd_goodsprc_dict
-> where PRC_ID in ('X3123','120717','X2831','120300','124268','121790','125567','128490')
-> 
-> select * from PD_GOODSPRCATTRLMT_REL where ATTR_ID = '10021' 
-> and PRC_ID in ('X3123','120717','X2831','120300','124268','121790','125567','128490')
-> and ATTR_VALUE in ();
-> delete from PD_GOODSPRCATTRLMT_REL where ATTR_ID = '10021' 
-> and PRC_ID in ('X3123','120717','X2831','120300','124268','121790','125567','128490') 
-> and ATTR_VALUE in ();
-> INSERT INTO `pd_goodsprcattrlmt_rel` (`GOODS_ID`, `PRC_ID`, `ATTR_ID`, `GROUP_ID`, `ATTR_VALUE`, `ATTR_TYPE`, `ACTIVE_FLAG`, `CREATE_LOGIN`, `CREATE_TIME`, `VERSION`, `TENANTID`, `LOGIN_ACCEPT`, `OP_TIME`, `LOGIN_NO`, `REMARK`) 
-> select distinct GOODS_ID, PRC_ID, '10021', '440000', 'CZCBN-202209-0172', '2', 'Y', 'gdcs02', '2022-09-23 18:00:41', NULL, '44', '16214', '2022-09-23 18:00:41', 'gdcs02', NULL
-> from pd_goodsprc_dict
-> where PRC_ID in ('X3123','120717','X2831','120300','124268','121790','125567','128490')
-> 
-> ```
->
-> ```java
-> 几个常用属性说明：
-> 10021：合同属性
-> 10022：批条属性
-> 20100：资费标签属性
-> 10062：周期性费用（入账务的一次性费用）
-> ```
-
-#### 1.2.9 设备类型列表
-
-> #### （1）取值来源
->
-> ```mysql
-> # 设备购买类型取值来源
-> select * from PD_DYNSRV_DICT where SVC_NAME = 'getUnicodedef';
-> SELECT CODE_ID,CODE_NAME FROM PD_UNICODEDEF_DICT WHERE CODE_CLASS='P900001'
-> # 设备类型取值来源
-> select * from PD_DYNSRV_DICT where SVC_NAME = 'getUnicodeDeviceType';
-> SELECT CODE_ID,CODE_NAME FROM PD_UNICODEDEF_DICT WHERE CODE_CLASS='P900002'
-> ```
->
-> #### （2）入库去向
->
-> ```java
-> 新增接口：IPdGoodsprcDictAoSvc_create
-> ```
->
-> 入表 **`PD_GOODSRESBUYTYPE_DICT`**  ，**购买类型**入字段为 **`BUYTYPE`** ，**设备类型**入字段为 **`RESTYPE`**，每增加一种设备类型就增加一条记录，**定价标识**入字段**`PRC_ID`**
-
-#### 1.2.10 品牌（隐藏）
-
-> #### （1）取值来源
->
-> ```mysql
-> 接口：IPdGoodsBrandRelAoSvc_queryByGoodsId
-> # 主要字段：BRAND_ID
-> SELECT A.GOODS_ID,A.BRAND_ID,B.BRAND_NAME
-> FROM PD_GOODSBRAND_REL A,PD_BRAND_DICT B
-> WHERE A.BRAND_ID = B.BRAND_ID
-> AND A.GOODS_ID = #{GOODS_ID}
-> ```
->
-> #### （2）入库去向
->
-> 入表 **`PD_GOODSPRC_DICT`**  字段为 **`BRAND_ID`** 
-
-#### 1.2.11 刷新缓存
+​		 发布速度特别的慢
 
 ```java
-//刷新缓存
-pdGoodsprcDictService.updateDspStatus();
+public class Producer {
+    //定义队列名称
+    private final static String QUEUE_NAME = UUID.randomUUID().toString();
+
+    public static void main(String[] args) throws Exception{
+        //创建连接工厂
+        Channel channel = RabbitMQUtil.getChannel();
+        /*
+        * 生成一个队列
+        * 1. 队列名称
+        * 2. 队列里面的消息是否持久化
+        * 3. 该队列是否只供一个消费者进行消费,是否进行共享 true:可以多个消费者消费
+        * 4. 是否自动删除,最后一个消费者端开连接以后该队列是否自动删除 true:自动删除
+        * 5. 其他参数
+        * */
+        channel.queueDeclare(QUEUE_NAME,true,false,false,null);
+        //开启发布确认
+        channel.confirmSelect();
+        /*
+         * 发送一个消息
+         * 1.发送到那个交换机
+         * 2.路由的 key 是哪个
+         * 3.其他的参数信息(如：消息实现持久化[MessageProperties.PERSISTENT_TEXT_PLAIN])
+         * 4.发送消息的消息体
+         * */
+        for (int i = 0; i < 1000; i++) {
+            String message = i + "发送的消息";
+            channel.basicPublish("",QUEUE_NAME, MessageProperties.PERSISTENT_TEXT_PLAIN,message.getBytes(StandardCharsets.UTF_8));
+            //单个发布确认：服务端返回 false 或超时时间内未返回，生产者可以消息重发
+            boolean flag = channel.waitForConfirms();
+        }
+        System.out.println("消息发送完毕");
+    }
+}
 ```
 
-### 1.2.13 验证功能：
+#### 4.5.3 批量确认发布：
 
-```
-接口: IGoodsCheckCoSvc_checkPrcCfgRule
-```
-
-
-
-## ★<font color='#900000'>P202-单商品定价发布</font>
-
-### 1.1 页面索引
+​		 当发生故障导致发布出现问题时，不知道是哪个消息出现 问题了，我们必须将整个批处理保存在内存中，以记录重要的信息而后重新发布消息。
 
 ```java
-起始页：pgcmng_op_web_view/pgcmng-base-app/npage/busi/gdfamily/P202/P202.html
-新增/修改接口：IPdGoodsReleaseDictAoSvc_creatRelease
-删除接口：IPdGoodsprcDictAoSvc_deleteGoodsPrc
+for (int i = 0; i < 1000; i++) {
+            String message = i + "发送的消息";
+            channel.basicPublish("",QUEUE_NAME, MessageProperties.PERSISTENT_TEXT_PLAIN,message.getBytes(StandardCharsets.UTF_8));
+            //批量发布确认
+            if(i % batchSize == 0){
+                boolean b = channel.waitForConfirms();
+            }
+        }
 ```
 
-### 1.2 取值与入库
+#### 4.5.4 异步确认发布
 
-#### 1.2.2 发布类型取值来源:
+​		异步确认虽然编程逻辑比上两个要复杂，但是性价比最高，无论是可靠性还是效率都没得说， 他是利用回调函数来达到消息可靠性传递的。
 
-> （1）取值来源
->
-> ```mysql
-> 动态SQL：select * from PD_DYNSRV_DICT where SVC_NAME = 'getClassId';
-> # 口径：
-> SELECT CODE_VALUE,CODE_NAME FROM PD_UNICODEDEF_DICT WHERE CODE_CLASS ='P900003'
-> ```
->
-> （2）入库去向
->
-> 入表 **<font color='#900abc'>PD_GOODSCLASS_REL</font>** ， 发布类型入字段 **<font color='#900abc'>CLASS_ID</font>** ，商品ID入字段 **<font color='#900abc'>GOODS_ID</font>** ，定价ID入字段 **<font color='#900abc'>PRC_ID</font>** ，每增加一种发布类型就增加一条记录
->
-> ```mysql
-> # 入库检查
-> select A.CLASS_ID 发布类型Id,B.CODE_NAME 发布类型名称
-> from PD_GOODSCLASS_REL A,PD_UNICODEDEF_DICT B
-> where A.CLASS_ID = B.CODE_VALUE 
-> and B.CODE_CLASS ='P900003'
-> and A.PRC_ID = 'M230614'
-> ```
->
-> 
+<img src="C:/Users/13656/Desktop/学习笔记/消息中间件/rabbitMq/image-20220624012611491.png" alt="image-20220624012611491" style="zoom:50%;" />
 
-#### 1.2.1 发布渠道取值来源：
+如何处理异步未确认消息：
 
-> （1）取值来源
->
-> ```mysql
-> select * from PD_DYNSRV_DICT where SVC_NAME = 'getChannelType';
-> # 口径 ：发布渠道（CODE_VALUE）
-> SELECT CODE_VALUE,CODE_NAME FROM PD_UNICODEDEF_DICT WHERE CODE_CLASS ='P900004'
-> ```
->
-> （2）入库去向
->
-> ```java
-> 新增/修改接口：IPdGoodsReleaseDictAoSvc_creatRelease
-> ```
->
-> 入表 **`PD_GOODSRELEASE_DICT`** ，客户配置区域入字段 **`GROUP_ID`** ， 发布渠道ID（CODE_VALUE）入字段为 **`CHANNEL_TYPE`** ，**RELEASE_ID自增** ，商品ID入字段**`GOODS_ID`** ，定价ID入字段**`PRC_ID`** ，商品每增加一种发布渠道就增加一条记录
->
-> ```mysql
-> # 入库检查
-> select A.CHANNEL_TYPE CHANNEL_TYPE发布渠道ID,B.CODE_NAME 发布渠道,A.GROUP_ID  GROUP_ID客户配置区域ID,C.org_name 客户配置区域,A.CTRL_CODE CTRL_CODE功能代码ID,D.CODE_NAME 功能代码
-> from PD_GOODSRELEASE_DICT A,PD_UNICODEDEF_DICT B,EP_ORGANIZATION C,PD_UNICODEDEF_DICT D
-> where A.CHANNEL_TYPE = B.CODE_VALUE 
-> and C.ORG_ID = A.GROUP_ID
-> and A.CTRL_CODE = D.CODE_ID 
-> and B.CODE_CLASS = 'P900004'
-> and D.CODE_CLASS = 'P25400001'
-> and A.PRC_ID = 'M230831'
-> ```
->
-> 
-
-#### 1.2.3 发布工号
-
-> （1）取值来源
->
-> ```mysql
-> 接口
-> com_sitech_pgcenter_atom_inter_IPdGoodsReleaseDictAoSvc_qryLoginGroup
-> # 口径：LOGIN_NO 工号,NICK_NAME 昵称
-> SELECT DISTINCT CODE_CLASS,CODE_DESC
->      FROM PD_UNICODEDEF_DICT
->      WHERE BEGIN_VALUE = 'A006'
-> ```
->
-> （2）入库去向
->
-> 入表 **`PD_GOODSRELAADD_DICT`**  **发布工号组织（群）**入字段 **`GROUP_ID`** ，**`FACTOR_TYPE`** 默认为**`A010`**
-
-#### 1.2.4 操作配置区域：
-
-> （1）取值来源：**同客户配置区域**
->
-> （2）入库去向
->
-> ```java
-> 新增\修改接口：IPdGoodsReleaseDictAo_creatRelease
-> ```
->
-> 入表 **`PD_GOODSRELAADD_DICT`**  **操作配置区域**入字段 **`FACTOR_VALUE`** ，**`FACTOR_TYPE`** 默认为**`A010`**每增加一个操作配置区域就增加一条记录
->
-> ```mysql
-> # 入库检查：
-> select A.FACTOR_VALUE 操作配置区域ID,C.org_name 操作配置区域
-> from PD_GOODSRELAADD_DICT A,EP_ORGANIZATION C
-> where C.ORG_ID = A.GROUP_ID
-> and A.PRC_ID = 'M230614'
-> ```
->
-> 
-
-说明：
-
-> 根据**定价ID**在表**`PD_GOODSRELEASE_DICT`**中获取**客户配置区域**，在表**`PD_GOODSRELAADD_DICT`**中获取**操作配置区域**
-
-#### 1.2.3 客户配置区域
-
-> （1）取值来源
->
-> ```mysql
-> 查询接口：IOrgManageSvc_getDistGroupTree1
-> 的
-> # 口径：获取有用字段GROUP_ID当前区域id，PARENT_GROUP_ID父级区域id，ORG_NAME 当前区域名称
-> select
-> 	a.GROUP_ID ,
-> 	a.PARENT_GROUP_ID ,
-> 	a.DENORM_LEVEL ,
-> 	a.PARENT_LEVEL,
-> 	a.CURRENT_LEVEL,
-> 	b.ORG_NAME ,
-> 	b.ORG_LEVEL ,
-> 	b.HAS_CHILD ,
-> 	b.ORG_INDEX ,
-> 	b.BUREAU_CODE,
-> 	b.BOSS_ORG_CODE ,
-> 	b.FIRST_CLASS_CODE ,
-> 	b.ORG_TYPE ,
-> 	b.STATUS_CD ,
-> 	b.CITY_GRADE_CODE,
-> 	b.CREATE_DATE ,
-> 	b.GRADE_CODE ,
-> 	b.ORG_DESC ,
-> 	b.CREDIT ,
-> 	b.BAIL,
-> 	b.BUSINESS_HOURS ,
-> 	b.OPEN_DATE ,
-> 	b.ORG_PHONE ,
-> 	b.FAX ,
-> 	b.LAYER_CODE ,
-> 	b.MAP ,
-> 	b.ACTIVE_TIME,
-> 	b.INVALID_TIME ,
-> 	b.AUDIT_FLAG ,
-> 	b.AUDIT_STATUS ,
-> 	b.AUDIT_TIME ,
-> 	b.ERP_CODE ,
-> 	b.REGION_ID ,
-> 	b.LOGIN_PREFIX ,
-> 	b.ORG_ADDR,
-> 	b.SERVICE_CONTENT ,
-> 	B.CREATE_STAFF ,
-> 	b.TWO_DIMENSIONAL_CODE ,
-> 	B.GIVEOUT_FLAG
-> from
-> 	EP_REGION_DICT c
-> inner join EP_ORGANIZATION b on
-> 	b.REGION_ID = c.REGION_ID
-> inner join EP_CHNGROUP_REL a on
-> 	b.ORG_ID = a.GROUP_ID
-> where
-> 	b.ORG_TYPE not in('21G', '94')
-> 	and b.STATUS_CD = '1'
-> 	and a.PARENT_GROUP_ID = '1'
-> 	and a.DENORM_LEVEL = 1
-> 	and b.VILLAGE_FLAG = 440000
-> 	and a.PROVINCE_ID = 440000
-> 	and c.PROVINCE_ID = 440000
-> order by
-> 	convert(b.ORG_NAME
-> 		using gbk);
-> ```
->
-> （2）入库去向
->
-> 入表 **`PD_GOODSRELEASE_DICT`** ，客户配置区域入字段 **`GROUP_ID`** ， 发布渠道ID（CODE_VALUE）入字段为 **`CHANNEL_TYPE`** ，功能代码入字段 **`CTRL_CODE`** ， **功能代码**入字段 **`CTRL_CODE`** ，**RELEASE_ID自增** ，商品ID入字段**`GOODS_ID`** ，定价ID入字段**`PRC_ID`** ，商品每增加一种发布渠道就增加一条记录
->
-> ```mysql
-> # 入库检查：
-> 移步：1.2.1发布渠道取值来源
-> ```
-
-#### 1.2.5 功能代码取值来源：
-
-> （1）取值来源
->
-> ```mysql
-> 接口：IPdUniCodeDefDictAoSvc_qryByCodeId
-> # 口径：CODE_ID,CODE_NAME
-> SELECT * FROM PD_UNICODEDEF_DICT WHERE CODE_CLASS = 'P25400001'
-> ```
->
-> （2）入库去向
->
-> 入表 **`PD_GOODSRELEASE_DICT`**  **功能代码**入字段 **`CTRL_CODE`** ，每增加一种功能代码就增加一条记录
->
-> ```mysql
-> # 入库检查：
-> 移步：1.2.1发布渠道取值来源
-> ```
-
-#### 1.2.6 发布地址入表
-
-> ```mysql
-> PD_GOODSPRCAREA_REL记录定价与小区代码的关系，支持按照地市配置
-> SELECT C.AREA_ID, C.REMARK
->      FROM PD_GOODSPRCAREA_REL C
->      WHERE C.PRC_ID = #{PRC_ID}
-> ```
-
-**对应关系**：与客户配置区域一一对应
-
-#### 注：`客户配置区域`与`发布渠道`对应关系
-
-**`PD_GOODSRELEASE_DICT`**  表中数据对应每个定价的关系：对于`每个定价`对应的`总条目数`为 "**<font color='#900000'>客户配置区域*发布渠道</font>**"，其中**<font color='#900000'>每个客户配置区域对应一组发布渠道</font>**，如发布渠道选择了两个，客户配置区域选择了两个，则每个客户配置区域对应两个发布渠道。
-
-<img src="C:/Users/13656/Desktop/项目索引/image-20220906142333631.png" alt="image-20220906142333631" style="zoom:50%;" />
-
-## ★P322融合商品配置
-
-### 1.1 页面索引
+​		 最好的解决的解决方案就是把未确认的消息放到一个基于内存的能被发布线程访问的队列， 比如说用 ConcurrentLinkedQueue 这个队列在 confirm callbacks 与发布线程之间进行消息的传递。
 
 ```java
-起始页：pgcmng_op_web_view/pgcmng-base-app/npage/busi/gdfamily/P323/P323.html
-新增页：pgcmng_op_web_view/pgcmng-base-app/npage/busi/gdfamily/P323/P323_goodsInfo.html
-js: pgcmng_op_web_view/pgcmng-base-app/nresource/assets/js/busi/gdfamily/P323/P323_goodsInfo.js
-创建接口：ICreateGoodsAndProdRelCoSvc_createGoodsAndProdRel
-修改接口：ICreateGoodsAndProdRelCoSvc_updateGoodsAndProdRel
-删除接口：ICreateGoodsAndProdRelCoSvc_deleteGoodsAndProdRel
+import com.example.messagequeue.demo.utils.RabbitMQUtil;
+import com.rabbitmq.client.Channel;
+import com.rabbitmq.client.ConfirmCallback;
+import com.rabbitmq.client.MessageProperties;
+
+import java.nio.charset.StandardCharsets;
+import java.util.Map;
+import java.util.Set;
+import java.util.UUID;
+import java.util.concurrent.ConcurrentNavigableMap;
+import java.util.concurrent.ConcurrentSkipListMap;
+
+public class Producer {
+    //定义队列名称
+    private final static String QUEUE_NAME = UUID.randomUUID().toString();
+
+    public static void main(String[] args) throws Exception{
+        //创建连接工厂
+        Channel channel = RabbitMQUtil.getChannel();
+        /*
+        * 生成一个队列
+        * 1. 队列名称
+        * 2. 队列里面的消息是否持久化
+        * 3. 该队列是否只供一个消费者进行消费,是否进行共享 true:可以多个消费者消费
+        * 4. 是否自动删除,最后一个消费者端开连接以后该队列是否自动删除 true:自动删除
+        * 5. 其他参数
+        * */
+        channel.queueDeclare(QUEUE_NAME,true,false,false,null);
+        //开启发布确认
+        channel.confirmSelect();
+        /*
+        * （2）定义一个线程安全有序的一个哈希表，用于记录发送的消息
+        * 将序号与消息关联
+        * */
+        ConcurrentSkipListMap<Long,Object> concurrentSkipListMap = new ConcurrentSkipListMap<>();
+        ConfirmCallback confirmCallback_success = (sequenceNumber,multiple) ->{
+            //multiple:是否为批量 清除已确认的消息，剩下的就是未确认的消息
+            if (multiple){
+                ConcurrentNavigableMap<Long, Object> success_message = concurrentSkipListMap.headMap(sequenceNumber,true);
+                success_message.clear();
+            }else {
+                concurrentSkipListMap.remove(sequenceNumber);
+            }
+        };
+        ConfirmCallback confirmCallback_error = (sequenceNumber,multiple) ->{
+            //获取未被确认的消息
+            ConcurrentNavigableMap<Long, Object> error_message = concurrentSkipListMap.headMap(sequenceNumber);
+            Set<Map.Entry<Long, Object>> entries = error_message.entrySet();
+            for (Map.Entry<Long, Object> entry : entries) {
+                Object value = entry.getValue();
+            }
+        };
+        /*
+        * (1)添加一个异步的确认监视器
+        * confirmCallback_success:成功的回调函数
+        * confirmCallback_error:失败的回调函数
+        * */
+        channel.addConfirmListener(confirmCallback_success,confirmCallback_error);
+
+        /*
+         * 发送一个消息
+         * 1.发送到那个交换机
+         * 2.路由的 key 是哪个
+         * 3.其他的参数信息(如：消息实现持久化[MessageProperties.PERSISTENT_TEXT_PLAIN])
+         * 4.发送消息的消息体
+         * */
+        for (int i = 0; i < 1000; i++) {
+            String message = i + "发送的消息";
+            //channel.getNextPublishSeqNo()获取下一个消息的序列号,通过序列号与消息体进行一个关联
+            concurrentSkipListMap.put(channel.getNextPublishSeqNo(),message);
+            channel.basicPublish("",QUEUE_NAME, MessageProperties.PERSISTENT_TEXT_PLAIN,message.getBytes(StandardCharsets.UTF_8));
+
+        }
+        System.out.println("消息发送完毕");
+    }
+}
 ```
 
-### 1.2  取值与入库
+发布确认和消息应答的区别：`**发布确认**`的目的是**<font color='#900000'>保证消息正确的发布</font>**到队列上，而`**消息应答**`的目的是**<font color='#900000'>确保每个消息都被消费</font>**了。	
 
-#### 1.2.1 商品基本属性
+## 5.交换机(Exchanges)
 
-> #### 入表 `PD_GOODS_DICT (商品信息表)`，其中<font color='#900000'>商品ID</font>入字段`GOODS_ID`，<font color='#900000'>商品名称</font>入字段`GOODS_NAME`，<font color='#900000'>商品描述</font>入字段`GOODS_DESC`，**<font color='#900000'>受理单描述</font>**入字段`REMARK`，<font color='#900000'>商品打包类型（0:原子商品，1:融合商品）</font>入字段`COM_FLAG`
+交换机的类型：默认、扇出、主题、直接
 
-#### 1.2.2 商品销售目录树	
+默认交换，我们通过空字符串("")进行标识。
 
-> **同** 单商品配置
+### 临时队列
 
-#### 1.2.3 业务品牌
+​		每当我们连接到 Rabbit 时，我们都需要一个全新的空队列，为此我们可以创建一个**具有随机名称 的队列**，或者能让服务器为我们选择一个随机队列名称那就更好了。其次**一旦我们断开了消费者的连 接，队列将被自动删除**。
 
-> **同** 单商品配置
-
-#### 1.2.4 协议期标识
-
-> **同** 单商品配置
-
-#### 1.2.5 商品附加属性
-
-> #### （1）取值来源
->
-> ```mysql
-> 单商品：
-> select * from PD_DYNSRV_DICT where SVC_NAME = 'getAttrList';
-> # 口径
-> SELECT A.ATTR_ID,A.VAR_NAME,A.ATTR_TYPE,A.CONTROL_TYPE,A.CONF_REMARK,A.DISP_TYPE,A.CTRL_CODE
-> FROM PD_ATTRCTRL_DICT A
-> WHERE A.ATTR_TYPE IN ('1','12','13','123') 
-> 融合商品：
-> select * from PD_DYNSRV_DICT where SVC_NAME = 'getMixAttrctrl';
-> # 口径
-> SELECT A.CONTROL_TYPE,A.ATTR_ID,A.VAR_NAME,A.ATTR_TYPE,A.CONF_REMARK,A.DISP_TYPE,A.CTRL_CODE 
-> FROM PD_ATTRCTRL_DICT A WHERE A.ATTR_TYPE IN ('3','13','23','123')
-> ```
->
-> #### （2）入库去向（同单商品）
->
-> ##### 入表`PD_GOODSATTR_DICT (商品属性表)`，商品标识入字段`GOODS_ID`，属性标识入字段`ATTR_ID`，
->
-> ##### <font color='#900000'>属性值</font>入字段`ATTR_VAL`，属性名称入字段`ATTR_NAME`
-
-## ★P322融合商品定价配置（合）
-
-### 1.1 页面索引
+<img src="C:/Users/13656/Desktop/学习笔记/消息中间件/rabbitMq/image-20220625145524839.png" alt="image-20220625145524839" style="zoom:50%;" />
 
 ```java
-起始页：pgcmng_op_web_view/pgcmng-base-app/npage/busi/gdfamily/P324/P324.html
-新增页：pgcmng_op_web_view/pgcmng-base-app/npage/busi/gdfamily/P324/P324_goodsPrc.html
-js: pgcmng_op_web_view/pgcmng-base-app/nresource/assets/js/busi/gdfamily/P324/P324_goodsPrc.js
-创建接口：IGrpGoodsCfgCoSvc_submitGrpGoodsPrc
-修改接口：IGrpGoodsCfgCoSvc_updateGrpGoodsPrc
-删除接口：IGrpGoodsCfgCoSvc_deleteGrpGoodsPrc
-详情接口：IGrpGoodsCfgCoSvc_qryGrpGoodsPrcContent
+//创建临时队列的方式如下:
+String queueName = channel.queueDeclare().getQueue();
 ```
 
-### 1.2  取值与入库
-
-#### 1.2.1 定价基本信息
-
-> 入表**<font color='#900000'>PD_GOODSPRC_DICT（商品定价信息表）</font>** **商品标识**入字段**<font color='#900000'>GOODS_ID</font>**，**定价标识**入字段**<font color='#900000'>PRC_ID</font>**，**定价名称**入字段**<font color='#900000'>PRC_NAME</font>**，**定价描述**入字段**<font color='#900000'>GOODS_PRC_DESC</font>**
-
-#### 1.2.1 附加属性下拉框取值口径
-
-> ```java
-> select * from PD_DYNSRV_DICT where SVC_NAME = 'getSelectAttrVal';
-> ```
-
-#### 1.2.3 融合列表
-
-```mysql
-select * from PD_DYNSRV_DICT where SVC_NAME = 'getBrandList';
-select * from PD_BRAND_DICT where PAR_BRAND_ID not in ('X','c3')
-
-select * from pd_goods_dict where GOODS_ID = 'SC1012' -- 1320
-select * from pd_goodsbrand_rel where GOODS_ID = 'SC1012' -- c1
-
-select  * from pd_goodsprc_dict pgd where GOODS_ID = 'SC1012' -- M1002839
-select  * from PD_GOODSPRCATTR_DICT where PRC_ID = 'M1002839'
-select  * from pd_goodsprcattrlmt_rel_his where GOODS_ID = 'SC1012'
-
-show full columns from PD_GOODSPRC_DICT 
-# 模板与融合定价关系 --> 根据定价（prc_id）查询使用到了哪个模板（templateid = 'T10064'） PD_GRPPRCDETAIL_REL
-SELECT * FROM PD_PRCGRPTEMPLATE_REL WHERE prc_id = 'M1002839'
-# 模板与品牌大项之间的关系 --> 根据模板id（templateid）获取定价包含的品牌类型（element_id）
-SELECT * FROM PD_GRPDETAILTEMPLATE_DICT WHERE  templateid = 'T10241' 
-# 组成成员与模板、定价标识以及品牌之间的关系 --> 根据模板id、融合定价查询以及品牌大项标识查询具体的单商品（sub_goods）及资费（sub_prc）
-SELECT * FROM PD_GRPCOMMBRPRC_REL WHERE templateid = 'T10241' and packge_prc = 'M1002839' and element_id in ( 'C1311','C1312','C1313' )
-# 资费与成员资费的关系的
-SELECT * FROM PD_GOODSPRC_DICT WHERE  prc_id in ()
-# 群资费约束构成关系
-SELECT * FROM PD_GRPPRCDETAIL_REL WHERE pkg_prcid = 'M1002839' and element_id in ( 'C1311','C1312','C1313' )
-# 成员主费约束
-SELECT * FROM PD_FAMNEWMBRPRC_REL WHERE pkgprc_id = 'M1002839' and element_id in ( 'C1311','C1312','C1313' )
-# 子资费主副端标识
-select * from PD_GRPDPRCATTRLMT_REL where  element_id in ( 'C1311','C1312','C1313' )
-```
-
-### 1.3融合构成分析
-
-```sql
-select A.GOODS_ID "融合商品标识",B.GOODS_NAME "融合商品名称",A.`STATE` "融合定价状态",A.PRC_ID "融合定价标识",A.PRC_NAME "融合定价名称",
-C.TEMPLATEID "模板ID",D.ELEMENT_ID "构成标识",E.SUB_GOODS "包含子商品标识",F.GOODS_NAME "包含子商品名称",E.SUB_PRC "包含子商品定价标识" ,G.PRC_NAME "包含子商品定价名称"
-from PD_GOODSPRC_DICT A,pd_goods_dict B,PD_PRCGRPTEMPLATE_REL C,PD_GRPDETAILTEMPLATE_DICT D,PD_GRPCOMMBRPRC_REL E,pd_goods_dict F,PD_GOODSPRC_DICT G
-where A.GOODS_ID = B.GOODS_ID 
-and C.PRC_ID = A.PRC_ID 
-and D.TENANTID = C.TENANTID 
-and E.PACKGE_PRC = A.PRC_ID 
-and E.TENANTID = C.TENANTID 
-and E.ELEMENT_ID = D.ELEMENT_ID 
-and F.GOODS_ID = E.SUB_GOODS 
-and G.PRC_ID = E.SUB_PRC 
--- and A.PRC_NAME like CONCAT('%','甜果','%')  and A.PRC_NAME like CONCAT('%','59','%') and A.PRC_NAME like CONCAT('%','20年','%')
--- and B.GOODS_NAME like CONCAT('%','甜果','%')  and B.GOODS_NAME like CONCAT('%','59','%') and B.GOODS_NAME like CONCAT('%','20年','%')
-and A.PRC_ID in ('M230691')
--- and B.GOODS_ID in ('44G1005227')
-and B.COM_FLAG = '1' 
-and A.`STATE` in ('A','S') -- A资费已发布，S资费待审核，X已下架
-```
-
-### 1.4 融合增加营销活动
-
-> 1.4.1 查询可用营销活动
->
-> ```java
-> 接口：com_sitech_pgcenter_comp_inter_IGrpGoodsCfgCoSvc_selectMarketing
-> 外部接口：http://crm-pgcenter-market-mng/QryActInfoCo/qryBindGroupAct
-> ```
->
-> 1.4.2 新增资费与营销关系
->
-> ```java
-> 接口：com_sitech_pgcenter_comp_inter_IGrpGoodsCfgCoSvc_addMarketingRel
-> 外部接口：http://crm-pgcenter-market-mng/CompBindRelCo/saveBusiBindRel
-> ```
->
-> 1.4.3 根据资费标识查询绑定的营销活动
->
-> ```java
-> 接口：com_sitech_pgcenter_comp_inter_IGrpGoodsCfgCoSvc_selectMarketingByPrcId
-> 外部接口：http://crm-pgcenter-market-mng/CompBindRelCo/queryBusiBindRel
-> ```
->
-> ```java
-> //查询营销
-> OutDTO selectMarketing(@RequestBody InDTO<RequestMessage<QryGoodsPrcListInDTO>> inDTO);
-> //新增资费与营销关系
-> OutDTO addMarketingRel(@RequestBody InDTO<RequestMessage<QryGoodsPrcListInDTO>> inDTO);
-> //查询资费与营销关系
-> OutDTO selectMarketingByPrcId(@RequestBody InDTO<RequestMessage<QryGoodsPrcListInDTO>> inDTO);
-> ```
 
 
+### 5.1 扇出交换机（fanout）[广播交换机]
 
+特点：交换机**<font color='#900000'>向所有队列</font>**发送消息，可以被多个消费者消费。
 
+实现：**只绑定交换机与队列**，而**<font color='#900000'>不声明路由</font>**值
 
-## ★<font color='#900000'>P022商品目录管理</font>
+<img src="C:/Users/13656/Desktop/学习笔记/消息中间件/rabbitMq/image-20220625145045303.png" alt="image-20220625145045303" style="zoom:50%;" />
 
-### 1.1 页面索引
-
-```html
-起始页：pgcmng_op_web_view/pgcmng-base-app/npage/busi/gdfamily/P022/P022.html
-
-```
-
-### 1.2 取值与入库
-
-#### 1.2.1 顶级目录查询
-
-**注**：同商品配置 ---> 商品销售目录树
-
-```mysql
-查询接口：IPdGoodscataDictAoSvc_queryPdGoodscataDictList
-口径：
-SELECT CATA_ID,CATA_NAME FROM PD_GOODSCATA_DICT WHERE BASE_CATA_FLAG ='A'
-```
-
-#### 1.2.2 子节点查询
-
-**注**：同商品配置 ---> 商品销售目录树
-
-```sql
-查询子节点接口：IPdGoodscataDictAoSvc_qryGoodsCata
-# 主要字段：CATA_ID当前节点，PAR_CATA_ID父节点
-SELECT  A.CATA_ID,
-     B.PAR_CATA_ID,
-     A.CATA_NAME,
-     B.CATA_LEVEL
-FROM 
-	    PD_GOODSCATA_DICT A,PD_GOODSCATA_REL B
-WHERE  
-		A.CATA_ID=B.CATA_ID 
-		and B.CATA_LEVEL = '1'
-		and B.CATA_ID != B.PAR_CATA_ID
-		and B.PAR_CATA_ID = #{cataId}
-```
-
-#### 1.2.3 叶子节点下添加商品
-
-> （1）添加接口：
->
-> ```java
-> IPdGoodscataitemDictAoSvc_addItem
-> ```
->
-> 入表**<font color='#900000'>PD_GOODSCATAITEM_DICT</font>** **商品标识(GOODS_ID)**入字段**<font color='#900000'>CATA_ITEM_ID</font>**,**目录树节点标识(CATA_ID)**入字段**<font color='#900000'>CATA_ID</font>**
-
-## ★P016商品管理
-
-### 1.1 页面索引
+代码：
 
 ```java
-起始页：pgcmng_op_web_view/pgcmng-base-app/npage/busi/gdfamily/P016/P016.html
-新增页：pgcmng_op_web_view/pgcmng-base-app/npage/busi/gdfamily/P016/P016_goodsInfo.html
-js: pgcmng_op_web_view/pgcmng-base-app/nresource/assets/js/busi/gdfamily/P016/P016_goodsInfo.js
-创建接口：ICreateGoodsAndProdRelCoSvc_createGoodsAndProdRel
-修改接口：ICreateGoodsAndProdRelCoSvc_updateGoodsAndProdRel
+//消费者1
+public class Customer1 {
+    final static String EXCHANGE_NAME = "exchange1";
+    public static void main(String[] args) throws Exception{
+        Channel channel = RabbitMQUtil.getChannel();
+        //声明一个交换机
+        channel.exchangeDeclare(EXCHANGE_NAME, BuiltinExchangeType.FANOUT);
+        //声明一个随机队列
+        String queue = channel.queueDeclare().getQueue();
+        //交换机与队列绑定
+        channel.queueBind(queue,EXCHANGE_NAME,"");
+        //接收消息
+        DeliverCallback deliverCallback = (consumerTag, delivery) ->{
+            String message = new String(delivery.getBody(), StandardCharsets.UTF_8);
+            System.out.println("成功接受消息" + message);
+        };
+        channel.basicConsume(queue,true,deliverCallback,consumerTag ->{});
+        System.out.println("消费者1：");
+    }
+}
+//消费者2
+public class Customer2 {
+    final static String EXCHANGE_NAME = "exchange1";
+    public static void main(String[] args) throws Exception{
+        Channel channel = RabbitMQUtil.getChannel();
+        //声明一个交换机
+        channel.exchangeDeclare(EXCHANGE_NAME, BuiltinExchangeType.FANOUT);
+        //声明一个随机队列
+        String queue = channel.queueDeclare().getQueue();
+        //交换机与队列绑定
+        channel.queueBind(queue,EXCHANGE_NAME,"");
+        //接收消息
+        DeliverCallback deliverCallback = (consumerTag, delivery) ->{
+            String message = new String(delivery.getBody(), StandardCharsets.UTF_8);
+            System.out.println("成功接受消息" + message);
+        };
+        channel.basicConsume(queue,true,deliverCallback,consumerTag ->{});
+        System.out.println("消费者2：");
+    }
+}
+//生产者
+public class Produce {
+    final static String EXCHANGE_NAME = "exchange1";
+    public static void main(String[] args) throws Exception{
+        Channel channel = RabbitMQUtil.getChannel();
+        channel.exchangeDeclare(EXCHANGE_NAME, BuiltinExchangeType.FANOUT);
+        //批量发送消息
+        for (int i = 0;i<10;i++){
+            String message = "发送的消息" + i;
+            channel.basicPublish(EXCHANGE_NAME, "",MessageProperties.PERSISTENT_TEXT_PLAIN,message.getBytes(StandardCharsets.UTF_8));
+        }
+    }
+}
 ```
 
-### 1.2  页面说明
+### 5.2 直接交换机（direct）
 
-> #### P016页面统一管理单商品和融合商品，查询列表中既包含单商品也包含融合商品
->
-> 单商品配置中，由**`P321/service_config_choose.html`**页面跳转到P016页面跳转中传入COM_FLAG（商品打包类型标识）的值为0，具体操作单商品还是融合商品由P016页面统一调度。
+特点：这种类型的工作方式是，**消息只去到它绑定的 routingKey 队列中去**。
 
-## ★P266商品关系管理
+实现：
 
-### 1.1 页面索引
+- **交换机**根据**路由**绑定**队列**；
+- **生产者**根据**交换机和路由**发送消息到指定队列；
+- **消费者**根据**指定队列**进行消费
+
+<img src="C:/Users/13656/Desktop/学习笔记/消息中间件/rabbitMq/image-20220625165814787.png" alt="image-20220625165814787" style="zoom:50%;" />
 
 ```java
-起始页：pgcmng_op_web_view/pgcmng-base-app/npage/busi/gdfamily/P266/P266_goodsrel.html
-新增页：pgcmng_op_web_view/pgcmng-base-app/npage/busi/gdfamily/P266/P266_insert.html
-js: pgcmng_op_web_view/pgcmng-base-app/nresource/assets/js/busi/gdfamily/P266/P266_insert.js
+//消费者1
+public class Customer1 {
+    final static String EXCHANGE_NAME = "exchange";
+    final static String QUEUE_NAME = "queue1";
+    public static void main(String[] args) throws Exception{
+        Channel channel = RabbitMQUtil.getChannel();
+        //声明一个交换机
+        channel.exchangeDeclare(EXCHANGE_NAME, BuiltinExchangeType.DIRECT);
+        //声明一个队列
+        channel.queueDeclare(QUEUE_NAME,true,false,false,null);
+        //交换机与队列和路由绑定
+        channel.queueBind(QUEUE_NAME,EXCHANGE_NAME,RouteUtil.MASSAGE.getValue());
+        channel.queueBind(QUEUE_NAME,EXCHANGE_NAME,RouteUtil.INFO.getValue());
+        //接收消息
+        DeliverCallback deliverCallback = (consumerTag, delivery) ->{
+            String message = new String(delivery.getBody(), StandardCharsets.UTF_8);
+            System.out.println("成功接受消息" + message);
+        };
+        channel.basicConsume(QUEUE_NAME,true,deliverCallback,consumerTag ->{});
+        System.out.println("消费者1：");
+    }
+}
+//消费者2
+public class Customer2 {
+    final static String EXCHANGE_NAME = "exchange";
+    final static String QUEUE_NAME = "queue2";
+    public static void main(String[] args) throws Exception{
+        Channel channel = RabbitMQUtil.getChannel();
+        //声明一个交换机
+        channel.exchangeDeclare(EXCHANGE_NAME, BuiltinExchangeType.DIRECT);
+        //声明一个队列
+        channel.queueDeclare(QUEUE_NAME,true,false,false,null);
+        //交换机与队列绑定
+        channel.queueBind(QUEUE_NAME,EXCHANGE_NAME,RouteUtil.WARRING.getValue());
+        //接收消息
+        DeliverCallback deliverCallback = (consumerTag, delivery) ->{
+            String message = new String(delivery.getBody(), StandardCharsets.UTF_8);
+            System.out.println("成功接受消息" + message);
+        };
+        channel.basicConsume(QUEUE_NAME,true,deliverCallback,consumerTag ->{});
+        System.out.println("消费者2：");
+    }
+}
+//生产者
+public class Produce {
+    final static String EXCHANGE_NAME = "exchange";
+    public static void main(String[] args) throws Exception{
+        Channel channel = RabbitMQUtil.getChannel();
+        //批量发送消息
+        for (int i = 0;i<10;i++){
+            String message = "发送的消息" + i;
+            channel.basicPublish(EXCHANGE_NAME, RouteUtil.INFO.getValue(), MessageProperties.PERSISTENT_TEXT_PLAIN,message.getBytes(StandardCharsets.UTF_8));
+        }
+    }
+}
+//枚举类路由
+public enum RouteUtil {
+    MASSAGE("massage"),
+    INFO("info"),
+    WARRING("warring");
+
+    private final String value;
+    private RouteUtil(String value) {
+        this.value = value;
+    }
+    public String getValue() {
+        return this.value;
+    }
+}
 ```
 
-### 1.2  取值与入库
+### 5.3 主题交换机
 
-1.2.1 查询
+特点：这种类型的工作方式是，**消息只去到它绑定的 routingKey 队列中去**。
 
-> 接口：
+实现：
+
+- **交换机**根据**路由**绑定**队列**；
+- **生产者**根据**交换机和路由**发送消息到指定队列；
+- **消费者**根据**指定队列**进行消费
+
+规则：
+
+*(星号)可以代替一个单词
+
+ #(井号)可以替代零个或多个单词
+
+样例：
+
+中间带 orange 带 3 个单词的字符串`*.orange.*`
+
+中间带 orange 带 3 个单词的字符串`*.orange.*`
+
+第一个单词是 lazy 的多个单词`lazy.#`
+
+
+
+<img src="C:/Users/13656/Desktop/学习笔记/消息中间件/rabbitMq/image-20220625175114486.png" alt="image-20220625175114486" style="zoom:50%;" />
+
+```java
+//消费者1
+public class Customer1 {
+    final static String EXCHANGE_NAME = ExchangeUtil.TOPIC.getExchangeType();
+    final static String QUEUE_NAME = QueueUtil.QUEUE_FIRST.getQueueValue();
+    final static String QUEUE_FIRST = QueueUtil.QUEUE_FIRST.getQueueValue();
+    public static void main(String[] args) throws Exception{
+        Channel channel = RabbitMQUtil.getChannel();
+        //创建主题交换机
+        channel.exchangeDeclare(EXCHANGE_NAME, BuiltinExchangeType.TOPIC);
+        //创建两个队列
+        channel.queueDeclare(QUEUE_FIRST, true,false,false,null);
+        //绑定关系
+        channel.queueBind(QUEUE_FIRST,EXCHANGE_NAME,"*.orange.*");
+        //接收消息
+        DeliverCallback deliverCallback = (consumerTag, delivery) ->{
+            String message = new String(delivery.getBody(), StandardCharsets.UTF_8);
+            System.out.println("成功接受消息：" + message);
+        };
+        channel.basicConsume(QUEUE_NAME,true,deliverCallback,consumerTag ->{});
+        System.out.println("消费者1：");
+    }
+}
+//消费者2
+public class Customer2 {
+    final static String EXCHANGE_NAME = ExchangeUtil.TOPIC.getExchangeType();
+    final static String QUEUE_NAME = QueueUtil.QUEUE_SECOND.getQueueValue();
+    final static String QUEUE_SECOND = QueueUtil.QUEUE_SECOND.getQueueValue();
+    public static void main(String[] args) throws Exception{
+        Channel channel = RabbitMQUtil.getChannel();
+        //创建主题交换机
+        channel.exchangeDeclare(EXCHANGE_NAME, BuiltinExchangeType.TOPIC);
+        //创建两个队列
+        channel.queueDeclare(QUEUE_SECOND, true,false,false,null);
+        //绑定关系
+        channel.queueBind(QUEUE_SECOND,EXCHANGE_NAME,"*.*.rabbit");
+        channel.queueBind(QUEUE_SECOND,EXCHANGE_NAME,"lazy.#");
+        //接收消息
+        DeliverCallback deliverCallback = (consumerTag, delivery) ->{
+            String message = new String(delivery.getBody(), StandardCharsets.UTF_8);
+            System.out.println("成功接受消息" + message);
+        };
+        channel.basicConsume(QUEUE_NAME,true,deliverCallback,consumerTag ->{});
+        System.out.println("消费者2：");
+    }
+}
+//生产者
+public class Produce {
+    final static String EXCHANGE_NAME = ExchangeUtil.TOPIC.getExchangeType();
+    public static void main(String[] args) throws Exception{
+        Channel channel = RabbitMQUtil.getChannel();
+        channel.exchangeDeclare(EXCHANGE_NAME,BuiltinExchangeType.TOPIC);
+        HashMap<String, String> bindingKeyMap = new HashMap<>();
+        bindingKeyMap.put("quick.orange.rabbit","quick.orange.rabbit被队列 Q1Q2 接收到1");
+        bindingKeyMap.put("lazy.orange.elephant","lazy.orange.elephant被队列 Q1Q2 接收到2");
+        bindingKeyMap.put("quick.orange.fox","quick.orange.fox被队列 Q1 接收到3");
+        bindingKeyMap.put("lazy.brown.fox","lazy.brown.fox被队列 Q2 接收到4");
+        for (Map.Entry<String, String> stringStringEntry : bindingKeyMap.entrySet()) {
+            String key = stringStringEntry.getKey();
+            String value = stringStringEntry.getValue();
+            System.out.println("发送：key="+key +"  value="+value);
+            channel.basicPublish(EXCHANGE_NAME, key,
+                    MessageProperties.PERSISTENT_TEXT_PLAIN,value.getBytes(StandardCharsets.UTF_8));
+        }
+    }
+}
+//交换机类型
+public enum ExchangeUtil {
+    TOPIC("topic"),
+    DIRECT("direct"),
+    FANOUT("fanout");
+
+    private final String value;
+    private ExchangeUtil(String value) {
+        this.value = value;
+    }
+    public String getExchangeType() {
+        return this.value;
+    }
+}
+```
+
+## 6.死信队列
+
+### 6.1 死信的概念
+
+​        queue 中的某些消息无法被消费，这样的消息如果没有 后续的处理，就变成了死信，有死信自然就有了死信队列。
+
+​        应用场景:为了保证订单业务的消息数据不丢失，需要使用到 RabbitMQ 的死信队列机制，当**消息消费发生异常**时，将消息投入死信队列中。还有比如说: 用户在**<font color='#900000'>商城下单成功并点击去支付后在指定时间未支付时自动失效。</font>**
+
+### 6.2 死信的来源
+
+- 消息 TTL 过期 
+- 队列达到最大长度(队列满了，无法再添加数据到 mq 中) 
+- 消息被拒绝(basic.reject 或 basic.nack)并且 requeue=false
+
+### 6.3 代码架构图
+
+<img src="C:/Users/13656/Desktop/学习笔记/消息中间件/rabbitMq/image-20220629104420237.png" alt="image-20220629104420237" style="zoom:50%;" />
+
+```java
+//整合死信队列的消费者
+public class Customer2 {
+    final static String EXCHANGE_NAME = ExchangeUtil.TOPIC.getExchangeType();
+    final static String DEAD_EXCHANGE = "dead_exchange";
+    final static String QUEUE_SECOND = QueueUtil.QUEUE_SECOND.getQueueValue();
+    final static String DEAD_QUEUE = "dead_queue";
+
+    public static void main(String[] args) throws Exception{
+        Channel channel = RabbitMQUtil.getChannel();
+
+        //声明死信交换机
+        channel.exchangeDeclare(DEAD_EXCHANGE,BuiltinExchangeType.DIRECT);
+        //创建死信队列
+        channel.queueDeclare(DEAD_QUEUE,true,false,false,null);
+        //死信队列绑定死信交换机及路由
+        channel.queueBind(DEAD_QUEUE,DEAD_EXCHANGE,"dead_routing");
+
+        //声明主题交换机
+        channel.exchangeDeclare(EXCHANGE_NAME, BuiltinExchangeType.TOPIC);
+        //设置正常队列绑定死信队列
+        HashMap<String, Object> map = new HashMap<>();
+        //正常队列设置死信交换机 参数 key 是固定值
+        map.put("x-dead-letter-exchange",DEAD_EXCHANGE);
+        //正常队列设置死信 routing-key 参数 key 是固定值
+        map.put("x-dead-letter-routing-key","dead_routing");
+        //设置队列最大长度
+        map.put("x-max-length",100);
+        channel.queueDeclare(QUEUE_SECOND, true,false,false,map);
+        //正常队列绑定关系
+        channel.queueBind(QUEUE_SECOND,EXCHANGE_NAME,"lazy.#");
+
+        //接收消息
+        DeliverCallback deliverCallback = (consumerTag, delivery) ->{
+            String message = new String(delivery.getBody(), StandardCharsets.UTF_8);
+            if(message.equals("info5")){
+                //requeue 设置为 false 代表拒绝重新入队 该队列如果配置了死信交换机将发送到死信队列中
+                channel.basicReject(delivery.getEnvelope().getDeliveryTag(), false);
+            }
+            System.out.println("成功接受消息" + message);
+        };
+        channel.basicConsume(QUEUE_SECOND,true,deliverCallback,consumerTag ->{});
+        System.out.println("消费者2：");
+    }
+}
+//死信队列消费者
+public class Customer1 {
+    final static String DEAD_EXCHANGE = "dead_exchange";
+    final static String DEAD_QUEUE = "dead_queue";
+    public static void main(String[] args) throws Exception{
+        Channel channel = RabbitMQUtil.getChannel();
+        //创建主题交换机
+        channel.exchangeDeclare(DEAD_EXCHANGE, BuiltinExchangeType.TOPIC);
+        //创建队列
+        channel.queueDeclare(DEAD_QUEUE, true,false,false,null);
+        //绑定关系
+        channel.queueBind(DEAD_QUEUE,DEAD_EXCHANGE,"dead_routing");
+        //接收消息
+        DeliverCallback deliverCallback = (consumerTag, delivery) ->{
+            String message = new String(delivery.getBody(), StandardCharsets.UTF_8);
+            System.out.println("成功接受消息：" + message);
+        };
+        channel.basicConsume(DEAD_QUEUE,true,deliverCallback,consumerTag ->{});
+        System.out.println("消费者1：");
+    }
+}
+//生产者
+public class Produce {
+    final static String EXCHANGE_NAME = ExchangeUtil.TOPIC.getExchangeType();
+    public static void main(String[] args) throws Exception{
+        Channel channel = RabbitMQUtil.getChannel();
+        channel.exchangeDeclare(EXCHANGE_NAME,BuiltinExchangeType.TOPIC);
+        //设置消息的过期时间10S
+        AMQP.BasicProperties properties = new AMQP.BasicProperties().builder().expiration("10000").build();
+
+        HashMap<String, String> bindingKeyMap = new HashMap<>();
+        bindingKeyMap.put("quick.orange.rabbit","quick.orange.rabbit被队列 Q1Q2 接收到1");
+        bindingKeyMap.put("lazy.orange.elephant","lazy.orange.elephant被队列 Q1Q2 接收到2");
+        bindingKeyMap.put("quick.orange.fox","quick.orange.fox被队列 Q1 接收到3");
+        bindingKeyMap.put("lazy.brown.fox","lazy.brown.fox被队列 Q2 接收到4");
+        for (Map.Entry<String, String> stringStringEntry : bindingKeyMap.entrySet()) {
+            String key = stringStringEntry.getKey();
+            String value = stringStringEntry.getValue();
+            System.out.println("发送：key="+key +"  value="+value);
+            channel.basicPublish(EXCHANGE_NAME, key,
+                    properties,value.getBytes(StandardCharsets.UTF_8));
+        }
+    }
+}
+```
+
+## 7. 延迟队列
+
+### 7.1  延迟队列使用场景
+
+1.订单在十分钟之内未支付则自动取消 
+
+2.新创建的店铺，如果在十天内都没有上传过商品，则自动发送消息提醒。 
+
+3.用户注册成功后，如果三天内没有登陆则进行短信提醒。 
+
+4.用户发起退款，如果三天内没有得到处理则通知相关运营人员。 
+
+5.预定会议后，需要在预定的时间点前十分钟通知各个与会人员参加会议
+
+### 7.2 订单流程
+
+<img src="C:/Users/13656/Desktop/学习笔记/消息中间件/rabbitMq/image-20220629112355900.png" alt="image-20220629112355900" style="zoom:33%;" />
+
+### 7.3 整合SpringBoot
+
+#### 7.3.1 依赖
+
+```xml
+<dependencies>
+ 	<!--RabbitMQ 依赖-->
+ 	<dependency>
+ 		<groupId>org.springframework.boot</groupId>
+ 		<artifactId>spring-boot-starter-amqp</artifactId>
+ 	</dependency>
+ 	<!--RabbitMQ 测试依赖-->
+ 	<dependency>
+ 		<groupId>org.springframework.amqp</groupId>
+ 		<artifactId>spring-rabbit-test</artifactId>
+ 		<scope>test</scope>
+ 	</dependency>
+</dependencies>
+```
+
+#### 7.3.2 配置文件
+
+```properties
+spring.rabbitmq.host=182.92.234.71
+spring.rabbitmq.port=5672
+spring.rabbitmq.username=admin
+spring.rabbitmq.password=admin
+```
+
+### 7.4 代码架构图
+
+​			创建两个队列 QA 和 QB，两者队列 TTL 分别设置为 10S 和 40S，然后在创建一个交换机 X 和死信交 换机 Y，它们的类型都是 direct，创建一个死信队列 QD，它们的绑定关系如下：
+
+<img src="C:/Users/13656/Desktop/学习笔记/消息中间件/rabbitMq/image-20220629113153759.png" alt="image-20220629113153759" style="zoom:50%;" />
+
+### 7.5 设置固定时长的延时队列
+
+```java
+@Configuration
+public class TtlQueueConfig {
+    public static final String X_EXCHANGE = "X";
+    public static final String QUEUE_A = "QA";
+    public static final String QUEUE_B = "QB";
+    public static final String Y_DEAD_LETTER_EXCHANGE = "Y";
+    public static final String DEAD_LETTER_QUEUE = "QD";
+    //声明正常交换机
+    @Bean("xExchange")
+    public DirectExchange getXExchange(){
+        return new DirectExchange(X_EXCHANGE);
+    }
+    //声明死信交换机
+    @Bean("yExchange")
+    public DirectExchange getYExchange(){
+        return new DirectExchange(Y_DEAD_LETTER_EXCHANGE);
+    }
+    //声明队列A 消息过期时间为 10s 并绑定到对应的死信交换机
+    @Bean("queueA")
+    public Queue queueA(){
+        Map<String, Object> args = new HashMap<>(3);
+        //声明当前队列绑定的死信交换机
+        args.put("x-dead-letter-exchange", Y_DEAD_LETTER_EXCHANGE);
+        //声明当前队列的死信路由 key
+        args.put("x-dead-letter-routing-key", "YD");
+        //声明队列的 TTL
+        args.put("x-message-ttl", 10000);
+        return QueueBuilder.durable(QUEUE_A).withArguments(args).build();
+    }
+    //声明队列A绑定到交换机
+    @Bean
+    public Binding queueaBindingX(@Qualifier("queueA") Queue queueA,
+                                  @Qualifier("xExchange") DirectExchange xExchange){
+        return BindingBuilder.bind(queueA).to(xExchange).with("XA");
+    }
+    //声明队列B 消息过期时间为 40s 并绑定到对应的死信交换机
+    @Bean("queueB")
+    public Queue queueB(){
+        Map<String, Object> args = new HashMap<>(3);
+        //声明当前队列绑定的死信交换机
+        args.put("x-dead-letter-exchange", Y_DEAD_LETTER_EXCHANGE);
+        //声明当前队列的死信路由 key
+        args.put("x-dead-letter-routing-key", "YD");
+        //声明队列的 TTL
+        args.put("x-message-ttl", 40000);
+        return QueueBuilder.durable(QUEUE_A).withArguments(args).build();
+    }
+    //声明队列B绑定到交换机
+    @Bean
+    public Binding queueaBindingB(@Qualifier("queueB") Queue queueA,
+                                  @Qualifier("xExchange") DirectExchange xExchange){
+        return BindingBuilder.bind(queueA).to(xExchange).with("XB");
+    }
+    //声明死信队列 QD
+    @Bean("queueD")
+    public Queue queueD(){
+        return new Queue(DEAD_LETTER_QUEUE);
+    }
+    //声明死信队列 QD 绑定关系
+    @Bean
+    public Binding deadLetterBindingQAD(@Qualifier("queueD") Queue queueD,
+                                        @Qualifier("yExchange") DirectExchange yExchange){
+        return BindingBuilder.bind(queueD).to(yExchange).with("YD");
+    }
+}
+```
+
+### 7.6 延时队列优化
+
+```java
+//生产者
+@RestController
+@RequestMapping("hello")
+public class SendMsgController {
+    @Autowired
+    private RabbitTemplate rabbitTemplate;
+
+    @GetMapping("send/{message}")
+    public void sendMsg(@PathVariable String message){
+        //生产者设置过期时间
+        String ttlTime = "10000";
+        rabbitTemplate.convertAndSend("X","XA",message,correlationData ->{
+            correlationData.getMessageProperties().setExpiration(ttlTime);
+            return correlationData;
+        });
+    }
+}
+//消息中间件配置
+@Configuration
+public class TtlQueueConfig {
+    public static final String X_EXCHANGE = "X";
+    public static final String QUEUE_A = "QA";
+    public static final String QUEUE_B = "QB";
+    public static final String Y_DEAD_LETTER_EXCHANGE = "Y";
+    public static final String DEAD_LETTER_QUEUE = "QD";
+    //声明正常交换机
+    @Bean("xExchange")
+    public DirectExchange getXExchange(){
+        return new DirectExchange(X_EXCHANGE);
+    }
+    //声明死信交换机
+    @Bean("yExchange")
+    public DirectExchange getYExchange(){
+        return new DirectExchange(Y_DEAD_LETTER_EXCHANGE);
+    }
+    //声明队列A 消息过期时间为 10s 并绑定到对应的死信交换机
+    @Bean("queueA")
+    public Queue queueA(){
+        Map<String, Object> args = new HashMap<>(3);
+        //声明当前队列绑定的死信交换机
+        args.put("x-dead-letter-exchange", Y_DEAD_LETTER_EXCHANGE);
+        //声明当前队列的死信路由 key
+        args.put("x-dead-letter-routing-key", "YD");
+        return QueueBuilder.durable(QUEUE_A).withArguments(args).build();
+    }
+    //声明队列A绑定到交换机
+    @Bean
+    public Binding queueaBindingX(@Qualifier("queueA") Queue queueA,
+                                  @Qualifier("xExchange") DirectExchange xExchange){
+        return BindingBuilder.bind(queueA).to(xExchange).with("XA");
+    }
+
+    //声明死信队列 QD
+    @Bean("queueD")
+    public Queue queueD(){
+        return new Queue(DEAD_LETTER_QUEUE);
+    }
+    //声明死信队列 QD 绑定关系
+    @Bean
+    public Binding deadLetterBindingQAD(@Qualifier("queueD") Queue queueD,
+                                        @Qualifier("yExchange") DirectExchange yExchange){
+        return BindingBuilder.bind(queueD).to(yExchange).with("YD");
+    }
+}
+//消费者
+@Component
+public class TtlQueueConsumer {
+    @RabbitListener(queues = "QD")
+    public void receive(Message message, Channel channel){
+        String s = new String(message.getBody());
+    }
+}
+```
+
+**<font color='#900000'>缺点</font>**：看起来似乎没什么问题，但是在最开始的时候，就介绍过如果使用在消息属性上设置 TTL 的方式，消息可能并不会按时“死亡“，因为 **RabbitMQ 只会检查第一个消息是否过期**，如果过期则丢到死信队列， **如果第一个消息的延时时长很长，而第二个消息的延时时长很短，第二个消息并不会优先得到执行**。
+
+## ★★★8. Rabbitmq 插件实现延迟队列
+
+### 8.1 安装延时队列插件
+
+在官网上下载 https://www.rabbitmq.com/community-plugins.html，下载 `rabbitmq_delayed_message_exchange` 插件，然后解压放置到 RabbitMQ 的插件目录。 
+
+进入 RabbitMQ 的安装目录下的 plgins 目录，执行下面命令让该插件生效，然后重启 RabbitMQ
+
+```shell
+cd /usr/lib/rabbitmq/lib/rabbitmq_server-3.8.8/plugins
+cp /home/software/rabbitmq_delayed_message_exchange-3.8.0.ez ./
+rabbitmq-plugins enable rabbitmq_delayed_message_exchange
+systemctl restart rabbitmq-server
+```
+
+<img src="C:/Users/13656/Desktop/学习笔记/消息中间件/rabbitMq/image-20220629214616202.png" alt="image-20220629214616202" style="zoom:33%;" />
+
+```java
+@Configuration
+public class TtlQueueConfig {
+    public static final String DELAYED_EXCHANGE = "delayed_exchange";
+    public static final String DELAYED_QUEUE = "delayed_queue";
+    public static final String DELAYED_ROUTING = "delayed_routing";
+    //自定义交换机
+    @Bean("exchange")
+    public CustomExchange getExchange(){
+        HashMap<String, Object> hashMap = new HashMap<>();
+        //自定义交换机类型
+        hashMap.put("x-delayed-type","direct");
+        return new CustomExchange(DELAYED_EXCHANGE, "x-delayed-message", true, false,
+                hashMap);
+    }
+    //声明队列A 消息过期时间为 10s 并绑定到对应的死信交换机
+    @Bean("queue")
+    public Queue queueA(){
+        return new Queue(DELAYED_QUEUE);
+    }
+    //声明队列A绑定到交换机
+    @Bean
+    public Binding queueaBindingX(@Qualifier("queue") Queue queue,
+                                  @Qualifier("exchange") CustomExchange exchange){
+        return BindingBuilder.bind(queue).to(exchange).with(DELAYED_ROUTING).noargs();
+    }
+}
+//生产者
+@RestController
+@RequestMapping("hello")
+public class SendMsgController {
+    public static final String DELAYED_EXCHANGE = "delayed_exchange";
+    public static final String DELAYED_QUEUE = "delayed_queue";
+    public static final String DELAYED_ROUTING = "delayed_routing";
+    @Autowired
+    private RabbitTemplate rabbitTemplate;
+
+    @GetMapping("send/{message}")
+    public void sendMsg(@PathVariable String message){
+        //生产者设置过期时间
+        String ttlTime = "10000";
+        rabbitTemplate.convertAndSend(DELAYED_EXCHANGE,DELAYED_ROUTING,message,correlationData ->{
+            correlationData.getMessageProperties().setExpiration(ttlTime);
+            return correlationData;
+        });
+    }
+}
+//消费者
+public static final String DELAYED_QUEUE = "delayed_queue";
+@RabbitListener(queues = DELAYED_QUEUE)
+public void receiveDelayedQueue(Message message){
+ String msg = new String(message.getBody());
+ log.info("当前时间：{},收到延时队列的消息：{}", new Date().toString(), msg);
+}
+```
+
+## 9. 发布确认高级
+
+### 9.1 确认机制方案
+
+<img src="C:/Users/13656/Desktop/学习笔记/消息中间件/rabbitMq/image-20220630002258487.png" alt="image-20220630002258487" style="zoom:40%;" />
+
+### 9.2 新增配置（application.properties）
+
+⚫  `NONE `禁用发布确认模式，是默认值 
+
+⚫ `CORRELATED` 发布消息成功到交换器后会触发回调方法 
+
+⚫ `SIMPLE` 经测试有两种效果，其一效果和 CORRELATED 值一样会触发回调方法， 其二在发布消息成功后使用 rabbitTemplate 调用 waitForConfirms 或 waitForConfirmsOrDie 方法 等待 broker 节点返回发送结果，根据返回结果来判定下一步的逻辑，要注意的点是 waitForConfirmsOrDie 方法如果返回 false 则会关闭 channel，则接下来无法发送消息到 broker
+
+```properties
+spring.rabbitmq.publisher-confirm-type=correlated
+```
+
+### 9.3 添加配置类 
+
+#### (1)配置交换机
+
+```java
+//配置交换机
+@Configuration
+public class TtlQueueConfig {
+    public static final String DELAYED_EXCHANGE = "delayed_exchange";
+    public static final String DELAYED_QUEUE = "delayed_queue";
+    public static final String DELAYED_ROUTING = "delayed_routing";
+    //自定义交换机
+    @Bean("exchange")
+    public CustomExchange getExchange(){
+        HashMap<String, Object> hashMap = new HashMap<>();
+        //自定义交换机类型
+        hashMap.put("x-delayed-type","direct");
+        return new CustomExchange(DELAYED_EXCHANGE, "x-delayed-message", true, false,
+                hashMap);
+    }
+    //声明队列A
+    @Bean("queue")
+    public Queue queueA(){
+        return new Queue(DELAYED_QUEUE);
+    }
+    //声明队列A绑定到交换机
+    @Bean
+    public Binding queueaBindingX(@Qualifier("queue") Queue queue,
+                                  @Qualifier("exchange") CustomExchange exchange){
+        return BindingBuilder.bind(queue).to(exchange).with(DELAYED_ROUTING).noargs();
+    }
+}
+```
+
+#### (2)回调接口
+
+```java
+/**
+ * @author liugp_oup
+ * @email liugp@si-tech.com.cn
+ * @create 2022-06-30 16:18
+ * @desc 消息回调接口
+ */
+@Component
+@Slf4j
+public class MyCallBack implements RabbitTemplate.ConfirmCallback,RabbitTemplate.ReturnCallback {
+    //消息确认回调
+    @Override
+    public void confirm(CorrelationData correlationData, boolean b, String s) {
+        String id=correlationData!=null?correlationData.getId():"";
+        if(b){
+            log.info("交换机已经收到 id 为:{}的消息",id);
+        }else{
+            log.info("交换机还未收到 id 为:{}消息,由于原因:{}",id,s);
+        }
+    }
+    //当消息无法路由的时候的回调方法
+    @Override
+    public void returnedMessage(Message message, int replyCode, String replyText, String exchange, String routingKey) {
+        //退回的消息
+        String backMessage = new String(message.getBody());
+        //退回的原因
+        System.out.println(replyText);
+    }
+}
+```
+
+#### (3)消息生产者
+
+```java
+/**
+ * @author liugp_oup
+ * @email liugp@si-tech.com.cn
+ * @create 2022-06-29 11:54
+ * @desc 生产者消息确认与回退,设置延时队列
+ */
+@RestController
+@RequestMapping("hello")
+public class SendMsgController {
+    public static final String DELAYED_EXCHANGE = "delayed_exchange";
+    public static final String DELAYED_QUEUE = "delayed_queue";
+    public static final String DELAYED_ROUTING = "delayed_routing";
+    @Autowired
+    private RabbitTemplate rabbitTemplate;
+    @Autowired
+    private MyCallBack myCallBack;
+    //依赖注入 rabbitTemplate 之后再设置它的回调对象
+    //在整个Bean初始化中的执行顺序：
+    //Constructor(构造方法) -> @Autowired(依赖注入) -> @PostConstruct(注释的方法)
+    @PostConstruct
+    public void init(){
+        rabbitTemplate.setConfirmCallback(myCallBack);
+        /**
+         * true：
+         * 交换机无法将消息进行路由时，会将该消息返回给生产者
+         * false：
+         * 如果发现消息无法进行路由，则直接丢弃
+         */
+        rabbitTemplate.setMandatory(true);
+        //设置回退消息交给谁处理
+        rabbitTemplate.setReturnCallback(myCallBack);
+
+    }
+
+    @GetMapping("send/{message}")
+    public void sendMsg(@PathVariable String message){
+        //生产者设置过期时间
+        String ttlTime = "10000";
+        //指定消息 id 为 1
+        CorrelationData correlationData1 = new CorrelationData(UUID.randomUUID().toString());
+        rabbitTemplate.convertAndSend(DELAYED_EXCHANGE,DELAYED_ROUTING,message,correlationData ->{
+            correlationData.getMessageProperties().setExpiration(ttlTime);
+            return correlationData;
+        },correlationData1);
+        //指定消息 id 为 1
+        CorrelationData correlationData2 = new CorrelationData(UUID.randomUUID().toString());
+        rabbitTemplate.convertAndSend(DELAYED_EXCHANGE,"routing2",message,correlationData ->{
+            correlationData.getMessageProperties().setExpiration(ttlTime);
+            return correlationData;
+        },correlationData2);
+    }
+}
+```
+
+#### (4)消息消费者
+
+```java
+@Component
+public class TtlQueueConsumer {
+    @RabbitListener(queues = "QD")
+    public void receive(Message message, Channel channel){
+        String s = new String(message.getBody());
+    }
+}
+```
+
+## 10.备份交换机
+
+### 10.1 代码架构图
+
+<img src="C:/Users/13656/Desktop/学习笔记/消息中间件/rabbitMq/image-20220701230630333.png" alt="image-20220701230630333" style="zoom:50%;" />
+
+```java
+/**
+ * @author liugp_oup
+ * @email liugp@si-tech.com.cn
+ * @create 2022-06-29 11:41
+ * @desc 备份交换机
+ */
+@Configuration
+public class TtlQueueConfig {
+    //主交换机
+    public static final String CONFIRM_EXCHANGE = "confirm_exchange";
+    public static final String CONFIRM_QUEUE = "confirm_queue";
+    public static final String CONFIRM_ROUTING = "confirm_routing";
+    //备份交换机
+    public static final String BACKUP_EXCHANGE_NAME = "backup_exchange";
+    public static final String BACKUP_QUEUE_NAME = "backup_queue";
+    public static final String BACKUP_ROUTING_NAME = "backup_routing";
+
+    //自定义交换机绑定备份交换机
+    @Bean("confirmExchange")
+    public DirectExchange confirmExchange(){
+        ExchangeBuilder exchangeBuilder = ExchangeBuilder.directExchange(CONFIRM_EXCHANGE).durable(true)
+                .withArgument("alternate-exchange", BACKUP_EXCHANGE_NAME);
+        return  exchangeBuilder.build();
+    }
+    //声明队列A
+    @Bean("confirmQueue")
+    public Queue confirmQueue(){
+        //不能直接  new Queue(),会连接不上rabbitMq
+        return QueueBuilder.durable(CONFIRM_QUEUE).build();
+    }
+    //声明队列A绑定到交换机
+    @Bean
+    public Binding queueBinding(@Qualifier("confirmQueue") Queue queue,
+                                  @Qualifier("confirmExchange") CustomExchange exchange){
+        return BindingBuilder.bind(queue).to(exchange).with(CONFIRM_ROUTING).noargs();
+    }
+    //声明备份扇型交换机
+    @Bean("backupExchange")
+    public FanoutExchange backupExchange(){
+        return new FanoutExchange(BACKUP_EXCHANGE_NAME);
+    }
+    // 声明备份队列
+    @Bean("backQueue")
+    public Queue backQueue(){
+        return QueueBuilder.durable(BACKUP_QUEUE_NAME).build();
+    }
+    // 声明备份队列绑定关系
+    @Bean
+    public Binding backupBinding(@Qualifier("backQueue") Queue queue,
+                                 @Qualifier("backupExchange") FanoutExchange backupExchange){
+        return BindingBuilder.bind(queue).to(backupExchange);
+    }
+}
+```
+
+注意：`mandatory` 参数与备份交换机可以一起使用的时候，如果两者同时开启，消息究竟何去何从？谁优先 级高，经过上面结果显示答案是**备份交换机优先级高**。
+
+## 11 RabbitMQ 高可用集群搭建
+
+### 11.1 初始化环境
+
+> （1）**分别修改主机名**
 >
-> ```java
-> IPdGoodsRelAoSvc_queryPdGoodsRelList
+> ```
+> hostnamectl set-hostname rabbit-node1
+> hostnamectl set-hostname rabbit-node2
+> hostnamectl set-hostname rabbit-node3
+> ```
+>
+> （2）**修改每台机器的 `/etc/hosts` 文件**
+>
+> ```
+> cat >> /etc/hosts <<EOF
+> 192.168.10.104 rabbit-node1
+> 192.168.10.105 rabbit-node2
+> 192.168.10.106 rabbit-node3
+> EOF
+> ```
+>
+> （3）**重启虚拟机便于系统识别hosts**
+>
+> ```
+> systemctl restart network
+> ```
+>
+> （4）配置 Erlang Cookie：RabbitMQ 服务启动时，erlang VM 会自动创建该 cookie 文件，默认的存储路径为 `/var/lib/rabbitmq/.erlang.cookie` 或 `$HOME/.erlang.cookie`，该文件是一个隐藏文件，需要使用 `ls -al` 命令查看
+>
+> ```
+> #拷贝 Erlang Cookie
+> scp /var/lib/rabbitmq/.erlang.cookie root@rabbit-node2:/var/lib/rabbitmq/
+> scp /var/lib/rabbitmq/.erlang.cookie root@rabbit-node3:/var/lib/rabbitmq/
+> ```
+>
+> （5）启动 RabbitMQ 服务,顺带启动 Erlang 虚拟机和 RbbitMQ 应用服务(在三台节点上分别执行以 下命令
+>
+> ```
+> rabbitmq-server -detached
+> ```
+>
+> （6）在节点 2 执行
+>
+> ```
+> # 1.停止服务
+> rabbitmqctl stop_app
+> # 2.重置状态
+> rabbitmqctl reset
+> # 3.节点加入, 在一个node加入cluster之前，必须先停止该node的rabbitmq应用，即先执行stop_app
+> rabbitmqctl join_cluster rabbit@rabbit-node1
+> # 4.启动服务
+> rabbitmqctl start_app
+> ```
+>
+> （7）在节点 3 执行
+>
+> ```
+> # 1.停止服务
+> rabbitmqctl stop_app
+> # 2.重置状态
+> rabbitmqctl reset
+> # 3.节点加入, 在一个node加入cluster之前，必须先停止该node的rabbitmq应用，即先执行stop_app
+> rabbitmqctl join_cluster rabbit@rabbit-node2
+> # 4.启动服务
+> rabbitmqctl start_app
+> ```
+>
+> （8）集群状态
+>
+> ```
+> rabbitmqctl cluster_status
+> ```
+>
+> （9）需要重新设置用户
+>
+> ```
+> 创建账号
+> rabbitmqctl add_user admin possword
+> 设置用户角色
+> rabbitmqctl set_user_tags admin administrator
+> 设置用户权限
+> rabbitmqctl set_permissions -p "/" admin ".*" ".*" ".*"
+> ```
+>
+> （10）解除集群节点(node2 和 node3 机器分别执行)
+>
+> ```shell
+> rabbitmqctl stop_app
+> rabbitmqctl reset
+> rabbitmqctl start_app
+> rabbitmqctl cluster_status
+> rabbitmqctl forget_cluster_node rabbit@node2(node1 机器上执行)
 > ```
 >
 > 
 
-#### 1.2.1 商品关系
+## 12 配置镜像队列
 
-> #### （1）取值来源
->
-> **A端商品标识** 和 **B端商品标识**均来源于**`PD_GOODS_DICT`**表
->
-> #### （2）入库去向
->
-> 入表**<font color='#900000'>PD_GOODS_REL</font>** **A端商品标识**入字段**<font color='#900000'>ELEMENT_IDA</font>**， **B端商品标识**入字段**<font color='#900000'>ELEMENT_IDAB</font>**， **商品关系**入字段**<font color='#900000'>RELATION_TYPE</font>**
->
-> **<font color='#900000'>注</font>：商品之间建立了某种关系，那么该商品下的所有定价也就继承了这种关系**
->
-> 商品关系：
->
-> ```java
-> 5-转移关系(变更)
-> 6-可选关系(依赖)
-> ```
+#### ★★★12.1 开启镜像队列
 
-1.2.1 批量添加商品关系
+目的：<font color='#900000'>**配置镜像队列的目的就是为了实现高可用**</font>
 
-> - 互动商品添加可选商品
->
-> ```sql
-> 接口：com_sitech_pgcenter_atom_inter_IPdGoodsRelAoSvc_createBatch
-> 口径：
-> SELECT DISTINCT F.GOODS_ID,F.GOODS_NAME
-> 		FROM PD_SRVCMDRELAT_REL D JOIN PD_PRODSVC_REL C
-> 		ON C.SVC_ID = D.SERVICE_CODE JOIN PD_GOODSPROD_REL E
-> 		ON E.PROD_ID = C.PROD_ID JOIN PD_GOODS_DICT F											ON F.GOODS_ID = E.GOODS_ID JOIN PD_GOODSBRAND_REL G
-> 		ON G.GOODS_ID = F.GOODS_ID
-> 		WHERE D.SRV_NET_TYPE = #{hlrCode}
-> 		  AND F.GOODS_TYPE = #{goodsType}
-> 		  AND F.EXP_DATE >= SYSDATE()
-> 		  AND G.BRAND_ID = 'd1'
-> UNION
-> 			SELECT DISTINCT A.GOODS_ID,A.GOODS_NAME
-> 			FROM PD_GOODS_DICT A JOIN PD_GOODSBRAND_REL B
-> 			ON A.GOODS_ID = B.GOODS_ID
-> 			WHERE A.GOODS_TYPE = #{goodsType}
-> 			AND B.BRAND_ID = 'e1'
-> 			AND A.EXP_DATE >= SYSDATE()
-> UNION
-> 			SELECT DISTINCT A.GOODS_ID,A.GOODS_NAME
-> 			FROM PD_GOODS_DICT A JOIN PD_GOODSBRAND_REL B
-> 			ON A.GOODS_ID = B.GOODS_ID
-> 			WHERE A.GOODS_TYPE = #{goodsType}
-> 			AND B.BRAND_ID = 'e3'
-> 			AND A.EXP_DATE >= SYSDATE()
-> ```
->
-> - 可选商品添加依赖关系
->
-> ```sql
-> SELECT DISTINCT
-> 	 A.GOODS_ID,
-> 	 A.GOODS_NAME
-> FROM  PD_GOODS_DICT A,PD_GOODSBRAND_REL B
-> WHERE A.GOODS_ID = B.GOODS_ID
-> 	AND A.GOODS_TYPE = #{goodsType}
-> 	AND B.BRAND_ID = #{brandId}
-> 	AND A.GOODS_NAME LIKE CONCAT('%',#{goodsName},'%')
+★**注：开启镜像队列时，虽然有多个备份队列<font color='#900000'>但</font>每次消息只会走一条队列，因此并不会出现多消费的情况**
+
+这里我们为**所有队列开启镜像配置**，其语法如下：
+
+```
+rabbitmqctl set_policy ha-all "^" '{"ha-mode":"all"}'
+```
+
+#### 12.2 复制系数
+
+在上面我们指定了 ha-mode 的值为 all ，代表消息会被同步到所有节点的相同队列中。这里我们之所以这样配置，因为我们本身只有三个节点，因此复制操作的性能开销比较小。如果你的集群有很多节点，那么此时复制的性能开销就比较大，此时需要选择合适的复制系数。通常可以遵循过半写原则，即对于一个节点数为 n 的集群，只需要同步到 n/2+1 个节点上即可。此时需要同时修改镜像策略为 exactly，并指定复制系数 ha-params，示例命令如下：
+
+```shell
+# ha-two:策略名 
+#“^”:表示任何消息队列都可以备份 “^mirror”:表示只有mirror开头的消息队列才能备份
+#"ha-mode":"exactly":策略模式 
+#"ha-params":2:镜像个数 
+#"ha-sync-mode":"automatic"：自动备份镜像模式
+rabbitmqctl set_policy ha-two "^" '{"ha-mode":"exactly","ha-params":2,"ha-sync-mode":"automatic"}'
+```
+
+除此之外，RabbitMQ 还支持使用正则表达式来过滤需要进行镜像操作的队列，示例如下：
+
+```
+rabbitmqctl set_policy ha-all "^ha\." '{"ha-mode":"all"}'
+```
+
+此时只会对 ha 开头的队列进行镜像。更多镜像队列的配置说明，可以参考官方文档：(Highly Available (Mirrored) Queues)[https://www.rabbitmq.com/ha.html]
+
+## 13 HAProxy+Keepalived搭建RabbitMQ高可用镜像模式集群
+
+|       ip       |        主机名         |        **当前节点上部署的服务**         |
+| :------------: | :-------------------: | :-------------------------------------: |
+| 192.168.10.104 |        master1        | rabbitmq服务、HAProxy、Keepalived（主） |
+| 192.168.10.105 |        master2        | rabbitmq服务、HAProxy、Keepalived（备） |
+| 192.168.10.106 |        mastre3        |            rabbitmq服务、vip            |
+|  192.168.10.3  | 虚拟 ip(确保ip不存在) |                   VIP                   |
+
+（1）linux 开启 IP 转发功能
+
+linux发行版默认情况下是不开启ip转发功能的。因为大部分用不到。但是，如果我们想架设一个linux路由或者vpn服务我们就需要开启该服务了。
+
+```shell
+1）查看是否开启转发
+cat /proc/sys/net/ipv4/ip_forward
+#返回1代表IP已开启，0 未开启
+2）临时开启
+echo 1 > /proc/sys/net/ipv4/ip_forward
+3）永久开启
+vim /etc/sysctl.conf
+net.ipv4.ip_forward = 1
+4）立即生效
+sysctl -p /etc/sysctl.conf &
+```
+
+（2）关闭selinux
+
+- 它叫做“安全增强型Linux（Security-Enhanced Linux）”，简称 SELinux，它是 Linux 的一个安全子系统。
+- 其主要作用就是最大限度地减小系统中服务进程可访问的资源（根据的是最小权限原则）。避免权限过大的角色给系统带来灾难性的结果。
+
+```shell
+#查看selinux状态
+[root@rabbitmq-1 ~]# getenforce
+Disabled
+#临时关闭selinux
+[root@rabbitmq-1 ~]# setenforce 0
+#永久关闭selinux
+[root@rabbitmq-1]# vim /etc/selinux/config
+将 SELINUX=enforcing 改为 SELINUX=disabled
+```
+
+（3）安装HAProxy
+
+> 用haproxy做负载均衡，在192.168.10.104、192.168.10.105 节点上安装haproxy服务
+
+```shell
+#安装命令。其中 -y 的含义：当安装过程提示选择全部为"yes"。
+yum install -y haproxy
+```
+
+（4）配置HAProxy
+
+```shell
+#1）首先备份原始配置（仅仅是备份下方便查阅其他配置项，不用的话可以直接改）
+cp /etc/haproxy/haproxy.cfg{,.bak}
+
+#2）编辑配置文件，配置文件具体内容如下
+vim /etc/haproxy/haproxy.cfg  
+```
+
+> ```shell
+> #----------------------------------------------------
+> # Global settings
+> #----------------------------------------------------
+> global
+>  log         127.0.0.1 local2 info #定义全局的syslog服务器。日志服务器需要开启UDP协议，最多可以定义两个。基于syslog记录日志到指定设备，级别有(err、warning、info、debug)
+>  chroot      /var/lib/haproxy #锁定haproxy的运行目录，把haproxy的进程禁锢在一个文件夹内
+>  pidfile     /var/run/haproxy.pid #指定haproxy的pid文件存放路径，启动进程的用户必须有权限访问此文件。要和service指定的pid路径一样
+>  maxconn     100000 #每个haproxy进程的最大并发连接数，默认4000，可以是100000，还可以更大：一百万
+>  maxconnrate 4000 #每个进程每秒创建的最大连接数量，控制瞬间并发
+>  user        haproxy #默认用户
+>  group       haproxy #默认组
+>  daemon #以后台守护进程的方式运行
+>  stats socket /var/lib/haproxy/stats #创建监控所用的套接字目录
+> #--------------------------------------------------
+> # defaults settings
+> #--------------------------------------------------
+> defaults
+>  mode                http #默认的模式mode { tcp|http|health }，tcp是4层，http是7层，health只会返回OK。后面listen的优先级比默认高，可以单独设置。
+>  log                 global
+>  option              dontlognull #启用该项，日志中将不会记录空连接。所谓空连接就是在上游的负载均衡器
+>  option              http-server-close #每次请求完毕后主动关闭http通道
+>  option              http-keep-alive #开启与客户端的会话保持
+>  option              redispatch #serverId对应的服务器挂掉后，强制定向到其他健康的服务器，重新派发。
+>  retries             3 #3次连接失败就认为服务不可用
+>  timeout http-request    10s
+>  timeout queue           1m
+>  timeout connect         30s #客户端请求从haproxy到后端server最长连接等待时间(TCP连接之前)，默认单位ms
+>  timeout client          2m #设置haproxy与客户端的最长非活动时间，默认单位ms，建议和timeout server相同
+>  timeout server          2m #客户端请求从haproxy到后端服务端的请求处理超时时长(TCP连接之后)，默认单位ms，如果超时，会出现502错误，此值建议设置较大些，访止502错误。
+>  timeout http-keep-alive 30s #session会话保持超时时间，此时间段内会转发到相同的后端服务器
+>  timeout check           10s #对后端服务器的默认检测超时时间
+>  maxconn                 10000 #最大连接数
+> #--------------------------------------------------
+> # haproxy监控统计界面 settings
+> #--------------------------------------------------
+> listen admin_stats
+>      stats   enable #自动开启
+>      bind    0.0.0.0:9188 #访问检测界面入口绑定的端口跟地址
+>      mode    http #http的七层模型
+>      option  httplog #采用http日志格式
+>      log     global
+>      maxconn 10 #默认最大连接数
+>      stats refresh 30s #统计页面自动刷新时间
+>      stats uri /admin_stats #统计页面url，设置haproxy监控地址为http://localhost:9188/admin_stats
+>      stats auth admin:admin  #设置监控页面的用户和密码认证：admin:dhgate20221012，可以设置多个用户名
+>      stats hide-version #隐藏统计页面上HAProxy的版本信息
+>      stats realm (Haproxy statistic platform) #统计页面密码框上提示文本
+>      stats admin if TRUE #设置手工启动/禁用，后端服务器(haproxy-1.4.9以后版本)
+> #--------------------------------------------------
+> # 监听rabbimq_server settings
+> #--------------------------------------------------
+> listen rabbitmq_server
+>      bind 0.0.0.0:55672 #指定HAProxy的监听地址，可以是IPV4或IPV6，可以同时监听多个IP或端口。MQ连接端口，避免跟5672端口冲突，将rabbitmq的5672端口映射为55672端口
+>      mode tcp #指定负载协议类型
+>      log global
+>      balance roundrobin #balance roundrobin 负载轮询，balance source 保存session值，支持static-rr，leastconn，first，uri等参数。
+>      server  rabbitmq1 192.168.10.104:5672 maxconn 4000 weight 1 check inter 5s rise 2 fall 2
+>      server  rabbitmq2 192.168.10.105:5672 maxconn 4000 weight 1 check inter 5s rise 2 fall 2
+>      server  rabbitmq3 192.168.10.106:5672 maxconn 4000 weight 1 check inter 5s rise 2 fall 2
+>      #rise 2是2次正确认为服务器可用
+>      #fall 2是2次失败认为服务器不可用
+>      #check inter 5s 表示检查心跳频率
+>      #weight代表权重
+>      #maxconn 4000 当前服务器支持的最大并发连接数，超出此值的连接将被放置于请求队列中
+> #--------------------------------------------------
+> # 监听rabbitmq_web settings
+> #--------------------------------------------------
+> listen rabbitmq_web
+>      bind 0.0.0.0:35672 #将rabbitmq的15672端口映射为35672端口
+>      mode http
+>      log global
+>      option httplog
+>      option httpclose
+>      balance roundrobin
+>      server  rabbitmq1 192.168.10.104:15672 maxconn 2000 weight 1 check inter 5s rise 2 fall 2
+>      server  rabbitmq2 192.168.10.105:15672 maxconn 2000 weight 1 check inter 5s rise 2 fall 2
+>      server  rabbitmq3 192.168.10.106:15672 maxconn 2000 weight 1 check inter 5s rise 2 fall 2
+> #--------------------------------------------------
 > ```
 >
 > 
 
-## ★P274商品定价关系管理
+（5）haproxy rsyslog日志配置
 
-### 1.1 页面索引
+```shell
+vim /etc/rsyslog.conf
+#在文件的最后一行，加上：
+local2.* /var/log/haproxy/rabbitmq.log
+```
+
+（6）重启日志服务+启动haproxy代理服务
+
+```shell
+#重启日志服务
+mkdir -p /var/log/haproxy && systemctl restart rsyslog.service
+
+#★启动haproxy。其中 -f 代表指定配置文件的路径。
+haproxy -f /etc/haproxy/haproxy.cfg
+
+#★查看haproxy启动的端口
+ss -nplt | grep haproxy
+
+#重新启动haproxy
+haproxy -f /etc/haproxy/haproxy.cfg -st `cat /var/run/haproxy.pid`
+
+#停止haproxy
+kill -9 `cat /var/run/haproxy.pid`
+```
+
+（7）访问HAProxy监控统计界面
+
+```shell
+http://192.168.10.104:9188/admin_stats
+http://192.168.10.105:9188/admin_stats
+这两个能正常访问HAProxy监控界面，用设定的amdin/admin 登录
+```
+
+（8）访问RabbitMQ管理界面
+
+```shell
+http://192.168.10.104:35672/#/
+http://192.168.10.105:35672/#/
+```
+
+### 安装Keepalived
+
+注：用keepalived做主备，避免单点问题、实现高可用。在172.22.40.104（主）、172.22.40.105（备） 节点上分别安装Keepalived。
+
+（9）安装相关命令
+
+```shell
+#安装
+yum install -y keepalived
+报错：
+--> 解决依赖关系完成
+错误：软件包：1:net-snmp-agent-libs-5.7.2-49.el7_9.2.x86_64 (updates)
+          需要：libmysqlclient.so.18()(64bit)
+错误：软件包：2:postfix-2.10.1-9.el7.x86_64 (@base)
+          需要：libmysqlclient.so.18(libmysqlclient_18)(64bit)
+错误：软件包：2:postfix-2.10.1-9.el7.x86_64 (@base)
+          需要：libmysqlclient.so.18()(64bit)
+错误：软件包：1:net-snmp-agent-libs-5.7.2-49.el7_9.2.x86_64 (updates)
+          需要：libmysqlclient.so.18(libmysqlclient_18)(64bit)
+解决：
+# wget http://www.percona.com/redir/downloads/Percona-XtraDB-Cluster/5.5.37-25.10/RPM/rhel6/x86_64/Percona-XtraDB-Cluster-shared-55-5.5.37-25.10.756.el6.x86_64.rpm
+# rpm -ivh Percona-XtraDB-Cluster-shared-55-5.5.37-25.10.756.el6.x86_64.rpm 
+
+#备份原有配置
+cp /etc/keepalived/keepalived.conf{,.bak}
+#配置Keepalived
+vim /etc/keepalived/keepalived.conf
 
 ```
-起始页：pgcmng_op_web_view/pgcmng-base-app/npage/busi/gdfamily/P274/P274.html
-新增接口：com_sitech_pgcenter_atom_inter_IPdGoodsPrcRelAoSvc_create
-```
 
-### 1.2  取值与入库
-
-1.2.1 新增
-
-> 新增接口：
+> 192.168.10.104节点为master，配置内容：
 >
-> ```java
-> IPdGoodsPrcRelAoSvc_create
-> ```
->
+> ```shell
+> ! Configuration File for keepalived
 > 
-
-#### 1.2.1 商品定价关系
-
-> #### （1）取值来源
->
-> **A端商品标识** 和 **B端商品标识**均来源于**`PD_GOODSPRC_DICT`**表
->
-> #### （2）入库去向
->
-> 入表**<font color='#900000'>PD_GOODSPRC_REL</font>** **A端商品定价标识**入字段**<font color='#900000'>ELEMENT_IDA</font>**， **B端商品定价标识**入字段**<font color='#900000'>ELEMENT_IDAB</font>**， **商品定价关系**入字段**<font color='#900000'>RELATION_TYPE</font>**
->
-> **<font color='#900000'>注</font>：商品之间建立了某种关系，那么该商品下的所有定价也就继承了这种关系**
->
-> 商品关系：
->
-> ```java
-> 5-转移关系(变更)
-> 6-可选关系(依赖)
-> 7-连带关系(绑定)
-> 19-续签转移关系
-> ```
-
-## ★P403统一视图管理
-
-> #### 同单商品配置详情
-
-
-
-## ★<font color='#900000'>P9987-批条配置</font>
-
-### 1.1 页面索引
-
-```java
-起始页：pgcmng_op_web_view/pgcmng-base-app/npage/busi/zjgd/P9987/P9987_main.html
-新增页：pgcmng_op_web_view/pgcmng-base-app/npage/busi/zjgd/P9987/P9987_add.html
-js: pgcmng_op_web_view/pgcmng-base-app/nresource/assets/js/busi/zjgd/P9987/P9987_add.js
-创建接口：IPdApproveInfoDictAoSvc_add
-
-```
-
-### 1.2  取值与入库
-
-#### 1.2.1 批条信息
-
-> #### （1）取值来源：前端
->
-> #### （2）入库去向
->
-> ##### 入表`	PD_APPROVEINFO_DICT  (批条信息表)`，批条标识入字段`APPROVE_NO`，是否有效入字段`VALIDFLAG`
-
-#### 1.2.2 <font color='#900000'>批条编号</font>、<font color='#900000'>服务代码</font>和<font color='#900000'>使用次数</font>关系
-
-> #### （1）取值来源：前端
->
-> #### （2）入库去向
->
-> ##### 入表`PD_APPROVEPHONENO_REL (批条编号和服务代码关系)`，批条标识入字段`APPROVE_NO`，服务号码入字段`PHONE_NO`，使用次数入字段`MAXNUMBER`
-
-#### 1.2.3 批条与资费关系
-
-> #### （1）取值来源
->
-> ```mysql
-> select PRC_ID from PD_GOODSPRC_DICT where STATE = 'A'
-> ```
->
-> #### （2）入库去向
->
-> #### 入库去向
->
-> ```java
-> 批条属性：ATTR_ID = 10022
-> ```
->
-> 入表**`PD_GOODSPRCATTR_DICT`**入的字段为**`ATTR_ID`**，只记录该定价包含哪些属性，每一种属性占据一条记录，
->
-> 而**`批条值`**记录在表**`PD_GOODSPRCATTRLMT_REL`**中，字段**`ATTR_ID`**以及**`ATTR_VALUE`**每个属性值占据一条记录。
->
-> ##### 资费入字段`PRC_ID`、固定属性`ATTR_ID = 10022`
-
-#### 1.2.4 批条与营销活动关系
-
-> #### （1）取值来源
->
-> ```mysql
-> SELECT
-> 	DISTINCT A.ACT_ID,A.ACT_NAME
-> FROM
-> 	MK_ACT_INFO A,MK_MEANS_INFO B
-> WHERE
-> 	A.ACT_ID = B.ACT_ID
-> 	AND B.VALID_FLAG = 'Y'
-> 	AND A.STATUS_CODE = '04'
-> 	AND A.START_DATE <= CURRENT_TIMESTAMP
-> 	AND A.END_DATE >= CURRENT_TIMESTAMP
-> ```
->
-> #### （2）入库去向
->
-> ##### 入表`MK_BUSITICKET_INFO (营销与批条关系表)`，批条标识（APPROVE_NO）入字段`DEFAULT_VALUE`、营销ID入字段`BUSI_ID`
->
-> 其中**`BUSI_TYPE = '02' ICKET_ID = '10022'`**
-
-#### 1.2.5 合同批条
-
-> 新增合同批条接口：
->
-> ```java
-> 新增、修改接口：IPdApproveInfoDictAoSvc_contract
-> ```
->
-> #### 入库去向
->
-> ```java
-> 合同属性：ATTR_ID = 10021
-> ```
->
-> 入表**`PD_GOODSPRCATTR_DICT`**入的字段为**`ATTR_ID`**，只记录该定价包含哪些属性，每一种属性占据一条记录，
->
-> 而**`合同批条值`**记录在表**`PD_GOODSPRCATTRLMT_REL`**中，字段**`ATTR_ID`**以及**`ATTR_VALUE`**每个属性值占据一条记录。
-
-## ★<font color='#900000'>P281-营销资费发布管理</font>
-
-### 1.1 页面索引
-
-```java
-起始页：pgcmng_op_web_view/pgcmng-base-app/npage/busi/hlj/P281/P281.html
-js: pgcmng_op_web_view/pgcmng-base-app/nresource/assets/js/busi/hlj/P281/P281.js
-创建接口：IPdMargoodsreleDictAoSvc_insertPdMargoodsrele
-修改接口：IPdMargoodsreleDictAoSvc_updatePdMargoodsrele
-删除接口：IPdMargoodsreleDictAoSvc_deletePdMargoodsrele
-```
-
-### 1.2  取值与入库
-
-#### 1.2.1 需要走营销的定价取值口径
-
-> 取值接口：IPdGoodsprcDictAoSvc_queryGoodsPrcListForMark
->
-> 口径：
->
-> ```sql
-> SELECT
->      A.PRC_ID,
->      A.GOODS_ID,
->      B.GOODS_NAME,
->      B.GOODS_TYPE,
->      B.COM_FLAG,
->      A.GOODS_PRC_DESC,
->      A.BRAND_ID,
->      A.EFF_RULE_ID,
->      A.EXP_RULE_ID,
->      A.CANCEL_RULE_ID,
->      A.USE_RANGE,
->      A.SALE_FLAG,
->      A.MIN_NUM,
->      A.MAX_NUM,
->      A.VERSION,
->      A.MODIFY_FLAG,
->      A.UNI_CODE,
->      A.EFF_NUM,
->      A.UNEXP_NUM,
->      A.PRC_CLASS,
->      A.CHINESE_INDEX,
->      A.PRC_NAME,
->      A.PRC_TYPE,
->      A.BILLING_MODE,
->      A.EFF_DATE,
->      A.EXP_DATE,
->      A.STATE,
->      A.CREATE_LOGIN,
->      A.CREATE_TIME,
->      C.BRAND_NAME,
->      A.OP_TIME
->      FROM
->      PD_GOODSPRC_DICT A JOIN PD_GOODS_DICT B ON A.GOODS_ID = B.GOODS_ID
->      LEFT JOIN PD_BRAND_DICT C ON A.BRAND_ID=C.BRAND_ID
->      WHERE
->      A.TENANTID = #{tenantid}
->      AND B.TENANTID = #{tenantid}
+> #keepalived全局配置
+> global_defs {
+> 	notification_email {
+>   1365689275@qq.com
+> }
+>  #keepalived检测到故障主备切换时发送邮件通知配置项。
+>  #这里我直接改成了调邮件和短信服务接口，没有使用keepalived的notify功能。
+>  #短信和邮件接口配置在/etc/keepalived/haproxy_check.sh脚本里。
 > 
-> ```
->
+>  #每个keepalived节点的唯一标识，不能与备机相同。
+>  router_id keepalived_master_192-168-10-104
+> }
 > 
-
-#### 1.2.1 权限和归属地市标识
-
-> #### （1）取值来源
->
-> - 权限
->
-> ```mysql
-> 取值接口：IStaffManageSvc_getUniCodeInfo
-> 口径：select * from EP_UNICODEDEF_DICT where CODE_CLASS='1002'
-> ```
->
-> - 归属地市标识
->
-> ```mysql
-> 取值接口：IOutInterCoSvc_getDistGroupTree => IOrgManageSvc_getDistGroupTree
-> 取值接口：IPdUniCodeDefDictAoSvc_getGroupMsg => 
-> 口径：select * from EP_ORGANIZATION where village_flag = '440000' and org_id = '1'
-> ```
->
-> #### （2）入库去向
->
-> 入表**`PD_MARGOODSRELE_DICT`**，其中**定价标识**入字段**`PRC_ID`**，**商品标识**入字段**`GOODS_ID`** **归属地市标识**入字段**`GROUP_ID`**，**权限**入字段**`POWER_RIGHT`**
-
-## <font color='#900000'>★P402-属性管理</font>
-
-### 1.1 页面索引
-
-```java
-起始页：pgcmng_op_web_view/pgcmng-base-app/npage/busi/zjgd/P402/P402_main.html
-js: pgcmng_op_web_view/pgcmng-base-app/nresource/assets/js/busi/hlj/P281/P281.js
-创建接口：IPdAttrCtrlDictAoSvc_create
-修改接口：IPdAttrCtrlDictAoSvc_create
-删除接口：IPdAttrCtrlDictAoSvc_delete
-```
-
-### 1.2  取值与入库
-
-#### 1.2.1 属性控制表（**`PD_ATTRCTRL_DICT`**）
-
-> 属性定义表模型列字段类型更改：字段CTRL_CODE （功能代码）类型由decimal(9,0)更改为varchar(10)
->
-> ```sql
-> alter table pd_attrctrl_dict modify column CTRL_CODE varchar(10)
-> alter table pd_attrctrl_dict_his modify column CTRL_CODE varchar(10)
-> ```
->
-> （1）功能代码
->
-> ```sql
-> 取值接口：IPdUniCodeDefDictAoSvc_qryByCodeId
-> 口径：SELECT DISTINCT * FROM PD_UNICODEDEF_DICT WHERE CODE_CLASS = 'P25400001';
-> 入库去向：入表`PD_ATTRCTRL_DICT`，入字段`CTRL_CODE`
-> ```
->
-> （2）是否展示（DISP_TYPE）
->
-> ```java
-> 入表`PD_ATTRCTRL_DICT`，入字段`DISP_TYPE`
-> ```
->
-> （3）页面元素类型（CONTROL_TYPE）
->
-> ```java
-> 取值有四种：11复选框；19文本框；20下拉框；16单选框
-> 入表`PD_ATTRCTRL_DICT`，入字段`CONTROL_TYPE`
-> ```
->
-> （4）属性类型（ATTR_TYPE）
->
-> ```java
-> 取值来源：select * from PD_DYNSRV_DICT where SVC_NAME = 'getAttrTypeCheckBox';
->  口径：select '[{"value":"基本属性","key":"0"},{"value":"单商品属性","key":"1"},{"value":"单商品定价属性","key":"2"},{"value":"融合商品属性","key":"3"}]'
-> 商品、定价属性取值的过滤条件，用于区分商品属性、商品定价属性、融合商品属性
-> 入表`PD_ATTRCTRL_DICT`，入字段`ATTR_TYPE`(需手动输入)
-> ```
-
-#### 1.2.2 属性值表（`PD_ATTRVAL_DICT`）
-
-> 当属性类型（CONTROL_TYPE）为11：复选框，20：下拉框，16：单选框之一时
->
-> 将属性对应的多个值入表`PD_ATTRVAL_DICT`，
->
-> 其中**<font color='#900000'>属性ID</font>**入字段**<font color='#900000'>ATTR_ID</font>**，**<font color='#900000'>属性值标识</font>**入字段**<font color='#900000'>ELEMENT_VALUE</font>**，**<font color='#900000'>属性值描述</font>**入字段**<font color='#900000'>ELEMENT_VALUE_NAME</font>**
->
+> #检测HAProxy脚本
+> vrrp_script check_haproxy {
+> script "/etc/keepalived/haproxy_check.sh" #脚本所在的目录
+> interval 10 #检测 haproxy 心跳频率：每隔10秒检测一次
+> weight 2 #权重
+> }
 > 
-
-#### 1.2.3 商品属性显隐性关系表（`PD_SEGMENTATTRLMT_REL`）
-
-> 当是否展示（DISP_TYPE）为'Y'时，入表
->
-> **商品属性显隐性关系以及功能代码入表 `PD_SEGMENTATTRLMT_REL`（商品、定价属性显隐性、功能代码关系表），其中**
->
-> OBJECT_TYPE： 对象类型0:不区分按照属性标识限制，1：商品定价，2：服务标识，3：商品标识;
->
-> OBJECT_ID：对象标识，类型配置0时，配置Z，OBJECT_TYPE=1：存定价，OBJECT_TYPE=2：服务标识，OBJECT_TYPE=3：商品标识;
->
-> ATTR_ID： 属性标识;
->
-> SEGMENT： 功能代码
->
-> DISP_TYPE：是否展示，Y：允许，N：不允许;
->
+> #虚拟路由器配置
+> vrrp_instance haproxy {
+>  state MASTER #设置虚拟路由器状态为MASTER，表示为主。
+>  interface ens33 #绑定当前虚拟路由器所使用的物理网卡，如eth0、bond0等，可通过ifconfig获得。
+>  virtual_router_id 51 #每个虚拟路由器的唯一标识。同属一个虚拟路由器的多个keepalived节点必须相同，务必要确保在同一网络中此值唯一。
+>  priority 100 #当前物理节点在此虚拟路由器中的优先级，值越大优先级越高。注意：主机的优先权要比备机高。
+>  advert_int 1 #心跳检查频率，单位：秒。
 > 
-
-## <font color='#900000'>★P416个人优惠销售品</font>
-
-### 1.1 页面索引
-
-```java
-起始页：pgcmng_op_web_view/pgcmng-base-app/npage/busi/gdfamily/P416/P416.html
-js: pgcmng_op_web_view/pgcmng-base-app/nresource/assets/js/busi/gdfamily/P416/P416.js
-查询个人优惠销售品接口：com_sitech_pgcenter_comp_inter_IPersonalDiscountCoSvc_qryDyFavConf
-增加、批量个人优惠销售品：com_sitech_pgcenter_comp_inter_IPersonalDiscountCoSvc_saveDyFavConf
-    外部接口：crm-cbn-home-inter/com_sitech_cbn_home_inter_controller_inter_IProvideProductControllerSvc_saveDyFavConf
-修改、批量个人优惠销售品：com_sitech_pgcenter_comp_inter_IPersonalDiscountCoSvc_updateDyFavConf
-    外部接口：
-```
-
-### 1.2  取值与入库
-
-> （1）新增个人优惠销售品来源取值口径
->
-> ```sql
-> 接口： IPersonalDiscountCoSvc_qryDyFavConf
-> SELECT
-> 	A.GOODS_ID,B.GOODS_NAME
-> FROM PD_GOODSCLASS_REL A,PD_GOODS_DICT B
-> WHERE A.GOODS_ID = B.GOODS_ID
-> 	AND A.CLASS_ID in ('d4','Z') 
-> ORDER BY A.OP_TIME DESC
-> # 说明：发布类型选择个人优惠销售品的商品才能被选到
+>  #认证机制
+>  authentication {
+>      auth_type PASS #认证类型
+>      auth_pass admin #秘钥，同一虚拟路由器的多个keepalived节点auth_pass值必须保持一致
+>  }
+> 
+>  #虚拟路由器的VIP，不指定网卡时默认添加在eth0上。在添加VIP地址时，需确保将要使用的VIP不存在，避免冲突。
+>  virtual_ipaddress {
+>      192.168.10.3 #对外开放的虚拟ip
+>  }
+> 
+>  #调用检测HAProxy的脚本
+>  track_script {
+>      check_haproxy
+>  }
+> }
 > ```
 >
-> （2）入库去向
+> 192.168.10.105节点为backup，配置内容：
 >
-> A. 存入**`PD_GOODSSALERULE_REL`**（商品与规则标识关系表），其中**`GOODS_ID`**入字段**`OBJECT_ID`**，规则标识**`RULE_ID`**入字段**`RULE_ID`**
->
-> B. 通过外部接口：**`crm-cbn-home-inter/`**
->
-> **`com_sitech_cbn_home_inter_controller_inter_IProvideProductControllerSvc_saveDyFavConf`**
->
-> 传值：
->
-> ```json
-> { "GOODS_NAME": "测试数据1",
-> "RULE_ID": "999999",
-> "SQL_CONFIG": "select '1' as offerId, '2' as offerName from dual",
-> "VALID_FLAG": "3"
+> ```shell
+> ! Configuration File for keepalived
+> 
+> #keepalived全局配置
+> global_defs {
+> 	notification_email {
+>   1365689275@qq.com
+> }
+>  #keepalived检测到故障主备切换时发送邮件通知配置项。
+>  #这里我直接改成了调邮件和短信服务接口，没有使用keepalived的notify功能。
+>  #短信和邮件接口配置在/etc/keepalived/haproxy_check.sh脚本里。
+> 
+>  #每个keepalived节点的唯一标识，不能与备机相同。
+>  router_id keepalived_backup_192-168-10-105
+> }
+> 
+> #检测HAProxy脚本
+> vrrp_script check_haproxy {
+> script "/etc/keepalived/haproxy_check.sh" #脚本所在的目录
+> interval 10 #检测 haproxy 心跳频率：每隔10秒检测一次
+> weight 2 #权重
+> }
+> 
+> #虚拟路由器配置
+> vrrp_instance haproxy {
+>  state BACKUP #设置虚拟路由器状态为BACKUP，表示为备。
+>  interface ens33 #绑定当前虚拟路由器所使用的物理网卡，如eth0、bond0等，可通过ifconfig获得。
+>  virtual_router_id 51 #每个虚拟路由器的唯一标识。同属一个虚拟路由器的多个keepalived节点必须相同，务必要确保在同一网络中此值唯一。
+>  priority  80 #当前物理节点在此虚拟路由器中的优先级，值越大优先级越高。注意：主机的优先权要比备机高。
+>  advert_int 1 #心跳检查频率，单位：秒。
+> 
+>  #认证机制
+>  authentication {
+>      auth_type PASS #认证类型
+>      auth_pass admin #秘钥，同一虚拟路由器的多个keepalived节点auth_pass值必须保持一致
+>  }
+> 
+>  #虚拟路由器的VIP，不指定网卡时默认添加在eth0上。在添加VIP地址时，需确保将要使用的VIP不存在，避免冲突。
+>  virtual_ipaddress {
+>      192.168.10.3 #对外开放的虚拟ip
+>  }
+> 
+>  #调用检测HAProxy的脚本
+>  track_script {
+>      check_haproxy
+>  }
 > }
 > ```
 >
 > 
 
+（10）编写HAProxy检测脚本
 
+接着，我们需要编写脚本：`haproxy_check.sh`
+脚本作用：检测haproxy服务，如果haproxy服务挂了则先尝试自动重启haproxy服务；如果重启不成功， 则关闭Keepalived服务并切换到backup。
 
-## ★P404 配置操作查询
+```shell
+#!/bin/bash
+#haproxy存活检测脚本
+#当发现haproxy服务挂掉时，先自动重启HAProxy的服务，如果启动不成功则关闭当前节点的Keepalived服务，并将虚拟vip飘到备用节点上。
 
-#### 1.1 页面索引
+#-----------全局变量------------start
+#本机ip
+localIP=`ip a|grep inet|grep global|grep brd|head -n 1|awk '{printf $2}'|cut -d "/" -f1`
+#backup节点ip
+backupIP="172.22.40.105"
 
-```
-起始页：pgcmng_op_web_view/pgcmng-base-app/npage/busi/zjgd/P404/P404_main.html
-js: pgcmng_op_web_view/pgcmng-base-app/nresource/assets/js/busi/zjgd/P404/P404.js
-查询接口：com_sitech_pgcenter_atom_inter_IPdCfgoprRdAoSvc_selectPdCfgoprRd	
-口径：SELECT
-        A.LOGIN_ACCEPT,
-        A.CFG_OBJ_TYPE,
-        A.CFG_OBJ_VAL,
-        A.CFG_OBJ_NAME,
-        A.LOGIN_NO,
-        A.SYSTEM_NOTE,
-        A.OP_TIME,
-        A.OP_NOTE,
-        A.OP_CODE,
-        A.REQ_FILE_ID,
-        A.APPLY_CODE,
-        A.APPLY_NAME,
-        A.REQ_FILE_PATH,
-        A.REQ_FILE_NAME,
-        C.FUNCTION_NAME
-        FROM
-        PD_CFGOPR_RD A
-        LEFT JOIN PS_FUNCTIONCODE_DICT C ON A.OP_CODE = C.FUNCTION_CODE
-```
+#邮件联系人
+mailTo="yuanjiabo@xxx.com"
+#短信联系人
+phoneTo="1342621xxxx"
 
-#### 1.2 配置操作新增
+#邮件主题
+mailsubject="队列集群高可用之Keepalived主备切换通知（vip floating）"
+mailsubjectForHAProxyUp="队列集群高可用之HAProxy服务挂掉通知"
+#邮件内容
+nodeList="172.22.40.104、172.22.40.105、172.22.40.106"
+mailbody="队列集群（集群节点:${nodeList}）高可用keepalived vrrp transition, 虚拟VIP地址切换至：${backupIP}，切换前的地址：${localIP}"
+#短信内容
+messagebody="检测到节点${localIP}的HAProxy服务挂掉，并尝试重启失败，停掉此节点上的keepalived服务，虚拟vip将floating到backup节点：${backupIP}"
+messageForHAProxyUp="检测到节点${localIP}的HAProxy服务挂掉，正在尝试重启中...重启成功！"
+#-----------全局变量------------end
 
-> 1.2.1 调用方式
->
-> ```java
-> //写入操作记录
-> pdCfgoprRdService.addCfgOprRd(CFG_OBJ_TYPE.PRICE, CFG_OP_TYPE.DELETE,
->                            inDTO.getBody().getBusiInfo().getPrcId(),
->                            inDTO.getBody().getBusiInfo().getPrcName(),
->                            inDTO.getBody().getOprInfo());
-> ```
->
-> 1.2.2 源码
->
-> ```java
-> public int addCfgOprRd(CFG_OBJ_TYPE cfgObjType, CFG_OP_TYPE cfgOpType,
->                         String cfgObjVal,String cfgObjName, OprInfo oprInfo) {
->      Optional.ofNullable(cfgObjVal).orElseThrow(() -> new NullPointerException("写入操作记录时，传入参数为空！！"));
->      TableBaseCol<Object> baseCol = new TableBaseCol<>();
->      String loginNo = oprInfo.getLoginNo();
->      String opCode = oprInfo.getOpCode();
->      String opNote = oprInfo.getOpNote();
->      StringBuffer stringBuffer = new StringBuffer();
->      stringBuffer.append(opNote)
->              .append(",于")
->              .append(baseCol.getOpTime())
->              .append("对")
->              .append(cfgObjVal)
->              .append("(")
->              .append(cfgObjName)
->              .append(")")
->              .append("，进行了")
->              .append(cfgOpType.getDesc())
->              .append("操作");
->      PdCfgoprRdEntity pdCfgoprRdEntity = new PdCfgoprRdEntity();
->      pdCfgoprRdEntity.setLoginAccept(baseCol.getOpAccept());
->      pdCfgoprRdEntity.setContactId("0");
->      pdCfgoprRdEntity.setCfgObjType(cfgObjType.getValue());
->      pdCfgoprRdEntity.setCfgObjVersion("1.0");
->      pdCfgoprRdEntity.setApplyCode(cfgOpType.getValue());
->      pdCfgoprRdEntity.setApplyName(cfgOpType.getDesc());
->      pdCfgoprRdEntity.setCfgObjVal(cfgObjVal);
->      pdCfgoprRdEntity.setCfgObjName(cfgObjName);
->      pdCfgoprRdEntity.setLoginNo(loginNo);
->      pdCfgoprRdEntity.setOpCode(opCode);
->      pdCfgoprRdEntity.setOpNote(String.valueOf(stringBuffer));
->      pdCfgoprRdEntity.setCreateDate(baseCol.getCreateTime());
->      pdCfgoprRdEntity.setOpTime(baseCol.getOpTime());
->      pdCfgoprRdEntity.setChannelType("Z");
->      pdCfgoprRdEntity.setSystemNote(String.valueOf(stringBuffer));
->      String s = Optional.ofNullable(oprInfo.getTenantId()).orElse("44");
->      pdCfgoprRdEntity.setTenantid(s);
->      int insert = baseMapper.insert(pdCfgoprRdEntity);
->      return insert;
->  }
-> ```
->
-> 1.2.3 入表**`PD_CFGOPR_RD`**，其中操作类型（01：创建，02：修改，：06：删除）入字段**`CFG_OP_TYPE`**，配置类型（0：商品，1：定价，2：产品，3：服务）入字段**`CFG_OBJ_TYPE`**，配置编码（服务、产品、商品、定价标识）入字段**`CFG_OBJ_VAL`**，操作名称（服务、产品、商品、定价名称）入字段**`CFG_OBJ_NAME`**，操作模块（OP_CODE）入字段**`OP_CODE`**，操作备注入字段**`OP_NOTE`**
+#haproxy服务存活检测
+if [ $(ps -C haproxy --no-header | wc -l) -eq 0 ];then
+    #记录日志
+    echo "检测到节点${localIP}的HAProxy服务挂掉，正在尝试重启中..." >> /etc/keepalived/keepalived_master2backup.log
+    #重启haproxy服务
+    haproxy -f /etc/haproxy/haproxy.cfg
 
-系统功能定义表：PS_FUNCTIONCODE_DICT
+    sleep 2s
 
-## ★P255商品定价审批管理
+    #haproxy自动重启成功，邮件+短信通知
+    if [ $(ps -C haproxy --no-header | wc -l) -eq 1 ];then
+        echo "检测到节点${localIP}的HAProxy服务挂掉，正在尝试重启中...重启成功！" >> /etc/keepalived/keepalived_master2backup.log
+        #发邮件
+        curl "http://172.21.200.247/message.php?item=mail&mailto=${mailTo}&subject=${mailsubjectForHAProxyUp}&msg=${messageForHAProxyUp}"
+        #发短信
+        curl "http://172.21.200.247/message.php?phone=${phoneTo}&msg=${messageForHAProxyUp}"
+    fi
+fi
 
-### 1.1 页面索引
+#这里最好休眠2s等待haproxy启动成功，不然下面的判断有可能还会出现找不到haproxy服务进程的情况
+#注意：这个sleep时间一定要比keepalived.conf配置里"检测 haproxy 心跳频率：interval  10"设置的时间要短，否则将卡在sleep这！
+sleep 2s
 
-```java
-起始页：pgcmng_op_web_view/pgcmng-base-app/npage/busi/gdfamily/P255/P255_prcPending.html
-js: pgcmng-base-app/nresource/assets/js/busi/gdfamily/P255/P255_prcPending.js
-创建接口：IPdGoodsApproveInfoAoSvc_create
-通过接口：IPdGoodsApproveInfoAoSvc_updateState
-```
+#自动重启不成功，进行vip切换操作，邮件+短信通知
+if [ $(ps -C haproxy --no-header | wc -l) -eq 0 ];then
+    echo "检测到节点${localIP}的HAProxy服务挂掉，尝试重启失败，停掉此节点上的keepalived服务，虚拟vip将飘到backup节点：${backupIP}" >> /etc/keepalived/keepalived_master2backup.log
 
-### 1.2  取值与入库
+    #发邮件
+    curl "http://邮件服务ip:port/message.php?item=mail&mailto=${mailTo}&subject=${mailsubject}&msg=${mailbody}"
 
-#### 1.2.1 商品定价审批新增
+    #发短信
+    curl "http://短信服务ip:port/message.php?phone=${phoneTo}&msg=${messagebody}"
 
-> #### （1）取值范围
->
-> ```
-> APP_OBJ_TYPE：0：商品 1：定价 2：产品 3：资费
-> ```
->
-> #### （2）入库去向 
->
-> ```java
-> 入表：PD_GOODSAPPROVE_INFO（商品审批信息表）
-> 其中，定价ID 入字段 APP_OBJ_VAL
-> GOODS_ID 入字段 CHECK_GOODS
-> ```
-
-## ★<font color='#900000'>P330-资源方案配置</font>
-
-```java
-起始页：pgcmng_op_web_view/pgcmng-base-app/npage/busi/zjgd/e704/html_config_choose.html
-```
-
-### 1. 设备分类配置
-
-1.1 初始化
-
-> （1）设备分类查询
->
-> **`PD_EQUIPMENTTYPE_DICT`**（设备分类定义表） 
->
-> **`PD_UNICODEDEF_DICT`**（统一码表）
->
-> ```mysql
-> 接口：IPdEquipmentTypeDictAoSvc_qryEqmTypeList
-> 口径：
-> select
-> 	A.OP_TIME,
-> 	A.TYPE_CODE,
-> 	A.TYPE_NAME,
-> 	A.RES_CLASS,
-> 	B.CODE_NAME as RES_CLASS_NAME
-> from
-> 	PD_EQUIPMENTTYPE_DICT A,
-> 	PD_UNICODEDEF_DICT B
-> where
-> 	A.RES_CLASS = B.CODE_ID
-> ```
->
-> 
-
-1.2页面索引
-
-```java
-起始页: pgcmng_op_web_view/pgcmng-base-app/npage/busi/zjgd/e702/e702_qry.html
-新增页：pgcmng_op_web_view/pgcmng-base-app/npage/busi/zjgd/e702/e702_add.html
-js: pgcmng_op_web_view/pgcmng-base-app/nresource/assets/js/busi/zjgd/e702/e702_add.js
-创建接口：IPdEquipmentTypeDictAoSvc_addEquiType
-```
-
-1.3  取值与入库
-
-> 入表**`PD_EQUIPMENTTYPE_DICT`**（设备分类定义表），其中**设备资源大类**（CM:宽带猫；SC:智能卡；STB:机顶盒）入字段**`RES_CLASS`**，**设备分类代码** 入字段 **`TYPE_CODE `**，**设备分类名称** 入字段 **`TYPE_NAME`**
->
-> ```java
-> PD_EQUIPMENTTYPE_DICT 设备分类定义表
-> RES_CLASS: 设备资源大类（CM:宽带猫；SC:智能卡；STB:机顶盒）
-> TYPE_CODE：设备分类代码
-> TYPE_NAME：设备分类名称
-> ```
->
-> 
-
-1.3 设备分类明细
-
-> （1）页面索引
->
-> ```java
-> 起始页: pgcmng_op_web_view/pgcmng-base-app/npage/busi/zjgd/e702/e702_dtail.html
-> 新增页：pgcmng_op_web_view/pgcmng-base-app/npage/busi/zjgd/e702/e702_adddtail.html
-> js: pgcmng_op_web_view/pgcmng-base-app/nresource/assets/js/busi/zjgd/e702/e702_adddtail.js
-> 创建接口：IPdEquipmentTypeDetailDictAoSvc_addEquiTypeDetail
-> ```
->
-> （2）初始化
->
-> ```mysql
-> 设备分类明细查询接口：IPdEquipmentTypeDetailDictAoSvc_qryEquiTypeDetail
-> 口径：
-> SELECT A.TYPE_CODE, A.RES_TYPE, A.OP_TIME,B.RES_NAME
-> FROM PD_EQUIPMENTTYPEDTAIL_DICT A,
->     SRESTYPE B
-> WHERE A.RES_TYPE = B.RES_TYPE
->  AND A.TYPE_CODE = #{TYPE_CODE}
-> ORDER BY A.OP_TIME,A.RES_TYPE
-> ```
->
-> ```java
-> PD_EQUIPMENTTYPEDTAIL_DICT(设备分类和具体设备关系表 )
-> TYPE_CODE: 设备分类标识
-> RES_TYPE: 具体设备
-> SRESTYPE(设备资源定义表)
-> RES_NAME:设备资源类型名称
-> ```
->
-> （3） 取值与入库
->
-> A.取值：具体设备取值
->
-> ```mysql
-> 动态SQL: select * from PD_DYNSRV_DICT where SVC_NAME = 'qryResType';
-> 口径：
-> select
-> 	RES_TYPE,RES_NAME
-> from
-> 	SRESTYPE
-> where
-> 	RES_CLASS = (select RES_CLASS from PD_EQUIPMENTTYPE_DICT where TYPE_CODE = '100000')
-> and RES_TYPE not in (
-> 	select
-> 		RES_TYPE
-> 	from
-> 		PD_EQUIPMENTTYPEDTAIL_DICT
-> 	where
-> 		TYPE_CODE = '100009' );
-> ```
->
-> B.入库
->
-> 入表**`PD_EQUIPMENTTYPEDTAIL_DICT`**（设备分类和设备资源类型关系表），**设备分类代码** 入字段 **`TYPE_CODE `**，**具体设备** 入字段 **`RES_TYPE`**
->
-> 注：类似于：华为手机（资源大类：CM:宽带猫；SC:智能卡；STB:机顶盒）-> Mate系列（设备分类）-> mate20,mate30（设备分类明细）
-
-### 2. 资源方案配置
-
-1.1 初始化
-
-> （1）资源方案配置列表查询
->
-> **`pd_resourceplan_dict`**（资源方案定义表）
->
-> ```mysql
-> 接口：IPdResourcePlanDictAoSvc_qryResPlanList
-> 口径：
-> select
-> 	PLAN_CODE,
-> 	PLAN_NAME,
-> 	SC_TYPE_CODE,
-> 	STB_TYPE_CODE,
-> 	CM_TYPE_CODE,
-> 	LOGIN_NO,
-> 	OP_TIME,
-> 	IFNULL(( select CONCAT_WS( '->', TYPE_CODE, TYPE_NAME ) from pd_equipmenttype_dict pdd where pdd.type_code = prd.sc_type_code and pdd.res_class = "SC" ), "无" ) SC_TYPE_NAME,
-> 	IFNULL(( select CONCAT_WS( '->', TYPE_CODE, TYPE_NAME ) from pd_equipmenttype_dict pdd where pdd.type_code = prd.stb_type_code and pdd.res_class = "STB" ), "无" ) STB_TYPE_NAME,
-> 	IFNULL(( select CONCAT_WS( '->', TYPE_CODE, TYPE_NAME ) from pd_equipmenttype_dict pdd where pdd.type_code = prd.cm_type_code and pdd.res_class = "CM" ), "无" ) CM_TYPE_NAME
-> from
-> 	pd_resourceplan_dict prd
-> where
-> 	1 = 1
-> order by
-> 	OP_TIME desc
-> ```
->
-> 
-
-1.2页面索引
+    service keepalived stop
+fi
 
 ```
-起始页: pgcmng_op_web_view/pgcmng-base-app/npage/busi/zjgd/e703/e703_qry.html
-新增页：pgcmng_op_web_view/pgcmng-base-app/npage/busi/zjgd/e703/e703_add.html
-js: pgcmng_op_web_view/pgcmng-base-app/nresource/assets/js/busi/zjgd/e703/e703_add.js
-创建接口：
+
+（11）启动keepalived的服务
+
+> 启动顺序：先启动master节点服务，再启动backup节点的服务。
+
+```shell
+#★启动keepalived服务
+service keepalived start
+
+#★查看keepalived状态
+[root@rabbitmq-1 keepalived] service keepalived status
+Redirecting to /bin/systemctl status  keepalived.service
+● keepalived.service - LVS and VRRP High Availability Monitor
+   Loaded: loaded (/usr/lib/systemd/system/keepalived.service; disabled; vendor preset: disabled)
+   Active: active (running) since Thu 2022-10-13 15:58:35 CST; 8min ago
+  Process: 19704 ExecStart=/usr/sbin/keepalived 
+  
+#查看keepalived启动日志：
+journalctl -xe
+
+#查看keepalived日志
+tail -f  /var/log/messages
+
+#停掉keepalived服务
+service keepalived stop
+
 ```
 
-1.3  取值与入库
+（11）测试vip是否可用
 
-> 入表**`pd_resourceplan_dict`**（资源方案定义表），其中**资源方案标识**入字段**`PLAN_CODE`**，**资源方案名称** 入字段 **`PLAN_NAME`**，**智能卡设备分类** 入字段 **`SC_TYPE_CODE`**，**机顶盒设备分类** 入字段 **`STB_TYPE_CODE`**，**宽带猫设备分类** 入字段 **`CM_TYPE_CODE`**
->
-> **智能卡设备分类取值**
->
-> ```mysql
-> 动态SQL: select * from PD_DYNSRV_DICT where SVC_NAME = 'getSCTypeCode';
-> 口径：
-> SELECT TYPE_CODE, CONCAT_WS( '->', TYPE_CODE, TYPE_NAME ) AS TYPE_NAME FROM pd_equipmenttype_dict WHERE RES_CLASS = 'SC'
-> ```
->
-> **机顶盒设备分类取值**
->
-> ```mysql
-> 动态SQL: select * from PD_DYNSRV_DICT where SVC_NAME = 'getSTBTypeCode';
-> 口径：
-> SELECT TYPE_CODE, CONCAT_WS( '->', TYPE_CODE, TYPE_NAME ) AS TYPE_NAME FROM pd_equipmenttype_dict WHERE RES_CLASS = 'STB'
-> ```
->
-> **宽带猫设备分类取值**
->
-> ```mysql
-> 动态SQL: select * from PD_DYNSRV_DICT where SVC_NAME = 'getCMTypeCode';
-> 口径：
-> SELECT TYPE_CODE, CONCAT_WS( '->', TYPE_CODE, TYPE_NAME ) AS TYPE_NAME FROM pd_equipmenttype_dict WHERE RES_CLASS = 'CM'
-> ```
->
-> 
-
-1.4 资源方案发布
-
-> （1）初始化
->
-> ```mysql
-> 接口：IPdBusiResPlanRelAoSvc_qryBusiResPlanList
-> 口径：
-> 		SELECT
->          A.plan_code PLAN_CODE,
->          b.plan_name PLAN_NAME,
->          a.busitype BUSI_TYPE,
->          c.businame BUSI_NAME,
->          A.login_no LOGIN_NO,
->          A.op_time OP_TIME
->      FROM
->          PD_BUSIRESPLAN_REL A,
->          PD_RESOURCEPLAN_DICT b,
->          PD_BUSITYPE_DICT c
->      WHERE
->          A.plan_code = b.plan_code
->          AND a.busitype = c.busitype
->          AND A.PLAN_CODE =#{planCode}
-> ```
->
-> **`PD_BUSITYPE_DICT`**（业务类型定义表: 用于产品配置-业务类型）
->
-> **`PD_RESOURCEPLAN_DICT`**（资源方案定义表）
->
-> **`PD_BUSIRESPLAN_REL`**（资源方案和业务类型关系表）
->
-> （2）新增
->
-> 业务类型取值
->
-> ```mysql
-> 动态SQL: select * from PD_DYNSRV_DICT where SVC_NAME = 'getBusiType';
-> 口径：
-> SELECT
-> 	* 
-> FROM
-> 	(
-> 	SELECT
-> 		aa.* 
-> 	FROM
-> 		(
-> 		SELECT
-> 			busitype,
-> 			businame 
-> 		FROM
-> 			PD_BUSITYPE_DICT 
-> 		WHERE
-> 			 busitype NOT IN ( SELECT busitype FROM PD_BUSIRESPLAN_REL WHERE plan_code = '100032' ) 
-> 		) aa 
-> 	) bb
-> ```
->
-> （3）入库
->
-> **`PD_BUSIRESPLAN_REL`**（资源方案和业务类型关系表），其中**资源方案标识**入字段**`PLAN_CODE`**，**业务类型** 入字段 **`BUSITYPE`**
-
-## ★<font color='#900000'>P417-商品折扣配置</font>
-
-### 1.1 起始页
-
-```java
-起始页：pgcmng_op_web_view/pgcmng-base-app/npage/busi/gdfamily/P426/P426.html
-创建接口：com_sitech_pgcenter_atom_inter_IPdGoodsprcDictAoSvc_insertGoodsPrcFav
-修改接口：
-删除接口：
+```
+http://192.168.10.3:35672/#/
 ```
 
-### 1.2 取值与入库
+（12）测试vip飘移（主备切换）并验证短信和邮件通知
 
-#### 1.2.1 定价与
+```shell
+#启动 haproxy 服务
+haproxy -f /etc/haproxy/haproxy.cfg
+#停止 kaproxy 服务
+kill -9 `cat /var/run/haproxy.pid`
+#重新启动 haproxy 服务
+haproxy -f /etc/haproxy/haproxy.cfg -st `cat /var/run/haproxy.pid`
+#查看 haproxy 服务状态
+ss -nplt | grep haproxy
+#启动 keepalived 服务
+service keepalived start
+#查看 keepalived 服务状态
+service keepalived status
+#停止 keepalived 服务
+service keepalived stop
 
-> #### （1）取值来源
->
-> ```mysql
-> 接口：IServiceOfGoodsInfoAoSvc_qryOfPages
-> #口径 主要字段：GOODS_ID
-> SQL: select * from PD_GOODS_DICT where COM_FLAG = '0'
-> ```
->
-> #### （2）入库去向
->
-> 新增:
->
-> ```java
-> 调用接口：IPdGoodsprcDictAoSvc_create
-> ```
->
-> 入表**<font color='#900000'>PD_GOODSPRC_DICT（商品定价信息表）</font>** **商品标识**入字段**<font color='#900000'>GOODS_ID</font>**，**定价标识**入字段**<font color='#900000'>PRC_ID</font>**，**定价名称**入字段**<font color='#900000'>PRC_NAME</font>**，**定价描述**入字段**<font color='#900000'>GOODS_PRC_DESC</font>**
+```
 
-#### 1.2.2 第三方SP互联网销售品
-
-> 配置第三方SP互联网销售品，需在商品附加属性添加相对应的属性类型(第三方SP互联网销售品采用不同属性ID区分)，
-> 配置定价时使用动态SQL判断定价所属商品的附加属性是否包含第三方SP互联网销售品，方便后期动态增删维护，
-> 若商品包含SP互联网销售品属性，在配置商品定价时动态添加外部商品授权码，存入PD_OUTGOODS_REL表，其中外部商品编码存入OUT_GOODS_ID字段，第三方SP互联网销售品对应的附件属性ID存入BIZ_CODE字段，商品ID存入GOODS_ID字段，定价ID存入PRC_ID字段。
->
-> （1）动态SQL:
->
-> ```sql
-> select * from PD_DYNSRV_DICT where SVC_NAME = 'getAllPrcClass';
-> # 口径
-> SELECT A.ATTR_ID,B.VAR_NAME
-> FROM PD_GOODSATTR_DICT A,PD_ATTRCTRL_DICT B 
-> WHERE A.ATTR_ID = B.ATTR_ID 
-> AND A.ATTR_ID  IN ('10402','10403','10404','10405','10408','10409')
-> AND A.GOODS_ID = #QRY_PARAM#
-> 
-> ```
->
-> 
